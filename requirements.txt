@@ -4,3 +4,4 @@ requests
 sniffio
 httpx
 typing_extensions
+tqdm
