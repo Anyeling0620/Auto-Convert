@@ -1,0 +1,39 @@
+name: Auto Convert Docx
+
+on:
+  push:
+    paths:
+      - 'input/**.docx'  # 监听 input 文件夹里的 docx 变化
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # 必须有写入权限才能提交结果
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Converter
+        env:
+          # 记得在仓库 Settings -> Secrets 里配置 ZHIPU_API_KEY
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: python scripts/converter.py
+
+      - name: Commit Result
+        run: |
+          git config --global user.name "GLM-Bot"
+          git config --global user.email "bot@zhipuai.cn"
+          git add output/questions_full.json
+          git commit -m "Auto-generated JSON from Docx [skip ci]" || echo "No changes"
+          git push
