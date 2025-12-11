@@ -3,7 +3,6 @@ import os
 import uuid
 import hashlib
 import time
-import re
 import requests
 from docx import Document
 from zhipuai import ZhipuAI
@@ -19,11 +18,11 @@ ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 
 # 【核心调优参数】
-AI_MODEL_NAME = "glm-4-flash"  # 极速版：高并发、低延迟、长上下文
-MAX_WORKERS = 8                # 并发线程数：Flash模型支持较高并发，8-10是安全区
-CHUNK_SIZE = 4000              # 切片大小：4000字符，保证上下文完整
-OVERLAP = 500                  # 重叠区域：防止题目被切断
-AI_TEMPERATURE = 0.01          # 温度极低：强制AI“死板”一点，保证JSON格式正确
+AI_MODEL_NAME = "glm-4-flash"  # 极速版：高并发、低延迟
+MAX_WORKERS = 8                # 并发线程数
+CHUNK_SIZE = 4000              # 切片大小
+OVERLAP = 500                  # 重叠区域
+AI_TEMPERATURE = 0.01          # 温度极低
 
 # ===========================================
 
@@ -128,7 +127,7 @@ def extract_global_answers(full_text):
     """
     
     try:
-        # 截取前 80k 字符 (Flash 支持 128k，留余量给 System Prompt)
+        # 截取前 80k 字符
         safe_text = full_text[:80000] 
         response = client.chat.completions.create(
             model=AI_MODEL_NAME,
@@ -148,13 +147,11 @@ def extract_global_answers(full_text):
 def clean_json_string(content):
     """清洗 AI 返回的字符串，提取 JSON 部分"""
     try:
-        # 1. 尝试去除 Markdown 代码块
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
         
-        # 2. 尝试寻找最外层的 []
         start = content.find('[')
         end = content.rfind(']')
         if start != -1 and end != -1:
@@ -199,17 +196,15 @@ def process_single_chunk(chunk_data):
         response = client.chat.completions.create(
             model=AI_MODEL_NAME,
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": chunk}],
-            temperature=AI_TEMPERATURE, # 0.01 保证格式稳定
+            temperature=AI_TEMPERATURE,
             top_p=0.7,
-            max_tokens=4000 # 允许长输出
+            max_tokens=4000
         )
         raw_content = response.choices[0].message.content
         clean_content = clean_json_string(raw_content)
-        
         return json.loads(clean_content)
         
     except json.JSONDecodeError:
-        # 常见错误：AI 没说完被截断，或者输出了非法 JSON
         print(f"      ⚠️ Chunk {index+1}: JSON 解析失败 (可能是内容被截断或格式错误)")
         return []
     except Exception as e:
@@ -219,7 +214,6 @@ def process_single_chunk(chunk_data):
 def main():
     start_time = time.time()
     
-    # 检查输入目录
     if not os.path.exists(INPUT_DIR): os.makedirs(INPUT_DIR)
     docx_files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".docx")]
     
@@ -237,35 +231,27 @@ def main():
         print(f"\n📄 [{file_idx+1}/{total_files}] 处理文件: {filename}")
         file_path = os.path.join(INPUT_DIR, filename)
         
-        # 读取
         raw_text = read_docx(file_path)
         if not raw_text: continue
 
-        # 1. 提取答案 (串行)
         global_answers = extract_global_answers(raw_text)
 
-        # 2. 切片
         chunks = get_chunks(raw_text, CHUNK_SIZE, OVERLAP)
         print(f"   📂 切分为 {len(chunks)} 个片段，开始 {MAX_WORKERS} 线程并发处理...")
         
-        # 3. 并发提取 (并行)
         file_added_count = 0
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 提交所有任务
             futures = [executor.submit(process_single_chunk, (chunk, i, len(chunks), global_answers)) 
                        for i, chunk in enumerate(chunks)]
             
-            # 处理结果
             for future in as_completed(futures):
                 items = future.result()
                 if items:
                     for item in items:
-                        # 去重
                         fp = generate_fingerprint(item)
                         if fp in seen_hashes: continue
                         seen_hashes.add(fp)
                         
-                        # 标准化 & 补全
                         item['category'] = normalize_category(item.get('category', '综合题'))
                         item['id'] = str(uuid.uuid4())
                         item['number'] = len(all_questions) + 1
@@ -276,7 +262,6 @@ def main():
                         
         print(f"   ✅ 文件处理完成，提取有效题目: {file_added_count} 道")
 
-    # 保存结果
     final_json = {
         "version": "Universal-HighConcurrency",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -290,20 +275,24 @@ def main():
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(final_json, f, ensure_ascii=False, indent=2)
 
-    # 统计与通知
     duration = time.time() - start_time
-    msg = (
-        f"<b>任务完成报告</b><br>"
-        f"耗时: {duration:.1f} 秒<br>"
-        f"处理文档: {total_files} 个<br>"
-        f"提取题目: {len(all_questions)} 道<br>"
-        f"并发线程: {MAX_WORKERS}<br>"
-        f"模型: {AI_MODEL_NAME}"
+    
+    # [修复点] 将 <br> 替换操作移到 f-string 之外，或者使用 clean 的方式
+    # 这里直接使用换行符
+    report_text = (
+        f"任务完成报告\n"
+        f"耗时: {duration:.1f} 秒\n"
+        f"处理文档: {total_files} 个\n"
+        f"提取题目: {len(all_questions)} 道\n"
+        f"并发线程: {MAX_WORKERS}"
     )
-    print(f"\n✨ {msg.replace('<br>', '\n')}")
+    
+    print(f"\n✨ {report_text}")
     print(f"💾 结果已保存至: {out_path}")
     
-    send_notification("✅ 题库转换成功", msg)
+    # 发送通知时可以使用 HTML 换行
+    html_msg = report_text.replace("\n", "<br>")
+    send_notification("✅ 题库转换成功", html_msg)
 
 if __name__ == "__main__":
     main()
