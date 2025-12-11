@@ -1,7 +1,4 @@
+openai>=1.0.0
 python-docx
-zhipuai>=2.0.1
 requests
-sniffio
-httpx
-typing_extensions
 tqdm
