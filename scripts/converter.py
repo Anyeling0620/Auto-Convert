@@ -21,12 +21,15 @@ PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 AI_BASE_URL = "https://api.deepseek.com"
 AI_MODEL_NAME = "deepseek-chat"
 
-# DeepSeek 速率限制较为严格，建议 5-10
-MAX_WORKERS = 8
-# 切片大小：2000 字符
+# 【狂暴模式配置】
+# 并发数：直接拉到 20。如果遇到 429 错误，脚本会自动退避，所以不用怕
+MAX_WORKERS = 20
 CHUNK_SIZE = 2000
 OVERLAP = 200
-MAX_RETRIES = 5
+# 重试：死磕 10 次
+MAX_RETRIES = 10
+# 超时：给它 180 秒（3分钟），防止因为DeepSeek生成慢而被我们主动断开
+API_TIMEOUT = 180
 
 # ===========================================
 
@@ -103,6 +106,13 @@ def normalize_category(raw_cat):
 
 def repair_json(json_str):
     json_str = json_str.strip()
+    # 移除可能存在的 Markdown 代码块
+    if "```json" in json_str:
+        json_str = json_str.split("```json")[1].split("```")[0]
+    elif "```" in json_str:
+        json_str = json_str.split("```")[1].split("```")[0]
+    json_str = json_str.strip()
+
     if not json_str.endswith("]"):
         last_brace = json_str.rfind("}")
         if last_brace != -1:
@@ -111,39 +121,20 @@ def repair_json(json_str):
 
 
 def extract_global_answers(full_text):
-    """
-    【关键修改】读取全文，提取分散的答案
-    """
-    print("   🔍 [Step 1] DeepSeek 正在全文扫描参考答案 (此过程可能较慢)...")
-
-    # DeepSeek 支持 64K context，这里截取前 100,000 字符 (约5万汉字)，覆盖绝大多数文档
-    # 如果文档特别大，DeepSeek 会自动处理或报错，我们做个安全截断
-    safe_text = full_text[:100000]
-
+    print("   🔍 [Step 1] DeepSeek 正在全文扫描参考答案...")
+    # 截取头尾，最大化覆盖率
+    safe_text = full_text[-50000:] + "\n" + full_text[:20000]
     prompt = """
-    你是一个文档分析师。这篇文档采用了“题目与答案交错”的排版方式（例如：50道题 -> 50个答案 -> 50道题...）。
-
-    【任务】
-    请通读全文，将分散在文档各个位置的“参考答案”全部提取出来，合并成一个“总答案表”。
-
-    【输出格式】
-    请直接输出答案列表，格式为：
-    1. A
-    2. B
-    ...
-
-    不要包含题目内容，只要答案。如果找不到答案，返回"无答案"。
+    你是一个文档分析师。请扫描文档，提取所有“参考答案”部分。
+    要求：只提取答案文本（如 1.A 2.B），按顺序排列，合并成一个列表。
+    如果找不到，返回“无”。
     """
-
     try:
         response = client.chat.completions.create(
             model=AI_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": safe_text}
-            ],
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": safe_text}],
             temperature=0.1,
-            stream=False
+            timeout=120
         )
         ans = response.choices[0].message.content
         print(f"   ✅ 参考答案库构建完成 (长度: {len(ans)} 字符)")
@@ -156,34 +147,23 @@ def extract_global_answers(full_text):
 def process_single_chunk(args):
     chunk, index, total, answer_key = args
 
-    # 动态裁剪 Answer Key，只保留相关的部分给切片（节省Token）
-    # 这里简单处理：如果 Answer Key 很大，只传前 10000 字符。
-    # 更优做法是让 DeepSeek 自己在全文里找，但在切片阶段我们只能给它“字典”
-    # 对于 DeepSeek，我们可以稍微给多点上下文。
-
     prompt = f"""
     你是一个试题提取专家。请将文本切片转换为 JSON 数组。
 
-    ### 全局参考答案库 (Global Answer Key)
-    --------------------------------------------------
-    {answer_key[:15000]} ... (答案库片段)
-    --------------------------------------------------
+    ### 全局参考答案库
+    {answer_key[:15000]} ... 
 
-    ### 任务要求
-    1. **提取题目**：忽略切片首尾不完整的残缺句。
-    2. **配对答案**：
-       - 提取题目后，查看其【题号】。
-       - 在上方的【全局参考答案库】中查找对应题号的答案。
-       - 如果题目文字附近自带答案，优先使用自带答案。
-       - **必须填入 answer 字段**。
+    ### 任务
+    1. **提取题目**：忽略切片首尾不完整句子。
+    2. **配对答案**：根据题号去答案库查找，或使用题目自带答案。**必须填入 answer 字段**。
     3. **推断类型**：自动判断 category 和 type。
 
-    ### JSON 输出格式
+    ### JSON 格式
     [
       {{
         "category": "单选题",
         "type": "SINGLE_CHOICE", 
-        "content": "题干内容...", 
+        "content": "题干...", 
         "options": [{{"label":"A", "text":"..."}}], 
         "answer": "A",
         "analysis": ""
@@ -191,35 +171,42 @@ def process_single_chunk(args):
     ]
     """
 
+    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
+            # 动态温度：重试次数越多，温度略微升高，防止死循环
+            temp = 0.0 if attempt < 2 else 0.2
+
             response = client.chat.completions.create(
                 model=AI_MODEL_NAME,
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": chunk}],
-                temperature=0.0,  # 绝对理智
-                max_tokens=4000
+                temperature=temp,
+                max_tokens=4000,
+                timeout=API_TIMEOUT  # 设置超时
             )
             content = response.choices[0].message.content
 
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-
-            content = content.strip()
+            # 清洗 & 修复
+            content = repair_json(content)
 
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
-                fixed = repair_json(content)
-                return json.loads(fixed)
+                if attempt == MAX_RETRIES - 1:
+                    print(f"      ❌ Chunk {index + 1} JSON 解析失败: {content[:50]}...")
+                continue  # 重试
 
         except Exception as e:
+            last_error = e
+            # 指数退避：1s, 2s, 4s, 8s...
             wait_time = (2 ** attempt) + random.uniform(0, 1)
+            # 只有最后几次重试才打印日志，避免刷屏
+            if attempt > 2:
+                print(f"      ⚠️ Chunk {index + 1} 重试 ({attempt + 1}/{MAX_RETRIES}): {e}")
             time.sleep(wait_time)
 
-    print(f"❌ Chunk {index + 1} 彻底失败。")
-    return []
+    # 彻底失败，返回 None 以便后续识别
+    return None
 
 
 def main():
@@ -235,44 +222,76 @@ def main():
     all_questions = []
     seen_hashes = set()
 
-    print(f"🚀 DeepSeek-V3 引擎启动 | 并发: {MAX_WORKERS} | 文档数: {len(docx_files)}")
+    print(f"🚀 DeepSeek 狂暴模式 | 并发: {MAX_WORKERS} | 重试: {MAX_RETRIES}次 | 文档: {len(docx_files)}")
 
     for filename in docx_files:
         print(f"\n📄 处理文件: {filename}")
         raw_text = read_docx(os.path.join(INPUT_DIR, filename))
         if not raw_text: continue
 
-        # 1. 提取答案 (全文扫描)
         global_answers = extract_global_answers(raw_text)
-
-        # 2. 切片
         chunks = get_chunks(raw_text, CHUNK_SIZE, OVERLAP)
 
-        # 3. 并发处理
-        tasks_args = [(chunk, i, len(chunks), global_answers) for i, chunk in enumerate(chunks)]
+        # 任务队列
+        # 使用字典存储 task: (chunk_data) 方便重试
+        tasks_map = {i: (chunks[i], i, len(chunks), global_answers) for i in range(len(chunks))}
+        failed_chunks = []
 
-        chunk_added = 0
+        # === Round 1: 并发处理 ===
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            results = list(tqdm(executor.map(process_single_chunk, tasks_args), total=len(chunks), unit="切片"))
+            # 提交任务
+            future_to_idx = {
+                executor.submit(process_single_chunk, tasks_map[i]): i
+                for i in tasks_map
+            }
 
-            for items in results:
-                if items:
-                    for item in items:
+            # 进度条
+            for future in tqdm(as_completed(future_to_idx), total=len(chunks), unit="切片"):
+                idx = future_to_idx[future]
+                result = future.result()
+
+                if result is None:
+                    # 记录失败的 Chunk
+                    failed_chunks.append(idx)
+                else:
+                    # 成功处理
+                    for item in result:
                         fp = generate_fingerprint(item)
                         if fp in seen_hashes: continue
                         seen_hashes.add(fp)
-
                         item['category'] = normalize_category(item.get('category', '综合题'))
                         item['id'] = str(uuid.uuid4())
                         item['number'] = len(all_questions) + 1
                         item['chapter'] = filename.replace(".docx", "")
                         all_questions.append(item)
-                        chunk_added += 1
 
-        print(f"   ✅ 提取完成: {chunk_added} 道题")
+        # === Round 2: 失败切片补救 (串行/低并发慢速重试) ===
+        if failed_chunks:
+            print(f"\n⚠️ 发现 {len(failed_chunks)} 个失败切片，正在进行慢速补救...")
+            for idx in failed_chunks:
+                print(f"   🚑 补救 Chunk {idx + 1}...")
+                # 补救时给予更高温度，碰运气
+                retry_args = tasks_map[idx]
+                # 这里我们稍微修改一下重试逻辑，或者直接递归调用 process_single_chunk
+                # 简单起见，直接再次调用
+                result = process_single_chunk(retry_args)
+
+                if result:
+                    print(f"      ✅ 补救成功！")
+                    for item in result:
+                        fp = generate_fingerprint(item)
+                        if fp in seen_hashes: continue
+                        seen_hashes.add(fp)
+                        item['category'] = normalize_category(item.get('category', '综合题'))
+                        item['id'] = str(uuid.uuid4())
+                        item['number'] = len(all_questions) + 1
+                        item['chapter'] = filename.replace(".docx", "")
+                        all_questions.append(item)
+                else:
+                    print(f"      ❌ 补救失败，放弃该切片。")
 
     final_json = {
-        "version": "DeepSeek-Interleaved",
+        "version": "DeepSeek-Berserk",
         "total_count": len(all_questions),
         "data": all_questions
     }
@@ -283,9 +302,9 @@ def main():
         json.dump(final_json, f, ensure_ascii=False, indent=2)
 
     duration = time.time() - start_time
-    msg = f"DeepSeek 处理完成！\n耗时: {duration:.1f}s\n题目: {len(all_questions)}"
+    msg = f"DeepSeek 狂暴处理完成！\n耗时: {duration:.1f}s\n题目: {len(all_questions)}\n并发: {MAX_WORKERS}"
     print(f"\n✨ {msg}")
-    send_notification("✅ DeepSeek 题库转换成功", msg.replace('\n', '<br>'))
+    send_notification("✅ 题库转换成功", msg.replace('\n', '<br>'))
 
 
 if __name__ == "__main__":
