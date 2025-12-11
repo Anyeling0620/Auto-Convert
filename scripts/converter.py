@@ -18,8 +18,12 @@ OUTPUT_FILE = "questions_full.json"
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 
-AI_BASE_URL = "https://api.deepseek.com"
-AI_MODEL_NAME = "deepseek-chat"
+# 1. 替换 Base URL (这是硅基流动的 API 地址)
+AI_BASE_URL = "https://api.siliconflow.cn/v1"
+
+# 2. 替换模型名称 (注意：硅基流动的模型名通常带有 deepseek-ai 前缀)
+# 具体名称请去硅基流动后台确认，通常是 "deepseek-ai/DeepSeek-V3"
+AI_MODEL_NAME = "deepseek-ai/DeepSeek-V3"
 
 # 【狂暴模式配置】
 # 并发数：直接拉到 20。如果遇到 429 错误，脚本会自动退避，所以不用怕
