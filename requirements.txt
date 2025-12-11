@@ -1,2 +1,7 @@
 python-docx
 zhipuai
+python-docx
+zhipuai>=2.0.1
+sniffio
+httpx
+typing_extensions
