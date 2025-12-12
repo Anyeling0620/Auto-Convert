@@ -56,7 +56,7 @@ if not API_KEYS:
     if __name__ == "__main__": exit(1)
 
 # ================= ⚙️ 性能策略 (稳健版) =================
-MAX_WORKERS = 8  # 并发数
+MAX_WORKERS = 16  # 并发数
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 1000  # 切片大小
 OVERLAP = 100
@@ -145,7 +145,8 @@ def repair_json(jstr):
 # ✅ 修复后的 process_chunk (确保一定返回3个值)
 def process_chunk(args):
     chunk, idx, ans_key = args
-    time.sleep(random.uniform(0.5, 2.0))
+    start_delay = (idx % 16) * 0.5
+    time.sleep(start_delay)
 
     prompt = f"""
             [系统角色设定]
