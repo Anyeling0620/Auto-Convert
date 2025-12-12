@@ -276,39 +276,71 @@ def main():
         if m: next_idx = max(next_idx, int(m.group(1)) + 1)
     target_file = os.path.join(OUTPUT_DIR, f"output{next_idx}.json")
 
-    print(f"🚀 [{SUBJECT}] 稳健模式启动 | Key池: {len(API_KEYS)}个 | 并发: {MAX_WORKERS}")
+    # 检测是否在 GitHub Actions 环境中运行
+    IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
+
+    print(f"🚀 [{SUBJECT}] 启动 | Key池: {len(API_KEYS)} | 并发: {MAX_WORKERS}")
 
     all_qs = []
     stats = {"file_count": len(files), "total_chunks": 0, "success_chunks": 0, "failed_chunks": 0, "errors": []}
 
     for fname in files:
-        print(f"\n📄 {fname}")
+        # 强制刷新缓冲区，确保文件名立即打印
+        print(f"\n📄 {fname}", flush=True)
         txt = read_docx(os.path.join(INPUT_DIR, fname))
         if not txt: continue
 
-        ans = extract_global_answers(txt)
+        # ❌ 彻底禁用阻塞式答案扫描
+        ans = ""
+
         chunks = get_chunks(txt, CHUNK_SIZE, OVERLAP)
-        stats['total_chunks'] += len(chunks)
+
+        # ✅ 【关键修正】在这里定义 total_c
+        total_c = len(chunks)
+        stats['total_chunks'] += total_c
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exc:
             futures = [exc.submit(process_chunk, (c, i, ans)) for i, c in enumerate(chunks)]
-            # 进度条刷新频率稍微调快一点
-            for fut in tqdm(as_completed(futures), total=len(chunks), mininterval=1.0, ncols=80):
-                qs, err = fut.result()
-                if err:
-                    stats['failed_chunks'] += 1
-                    stats['errors'].append(err)
-                    print(f"   ❌ {err}")
-                else:
-                    stats['success_chunks'] += 1
-                    if qs:
-                        for q in qs:
-                            q['id'] = str(uuid.uuid4())
-                            q['number'] = len(all_qs) + 1
-                            q['chapter'] = fname.replace(".docx", "")
-                            q['category'] = normalize_category(q.get('category', '综合题'))
-                            if 'analysis' not in q: q['analysis'] = ""
-                            all_qs.append(q)
+
+            # === 分支处理：CI环境用普通打印，本地用进度条 ===
+            if IN_GITHUB_ACTIONS:
+                # GitHub Actions 模式：纯文本日志，无进度条
+                for i, fut in enumerate(as_completed(futures)):
+                    qs, err = fut.result()
+                    # flush=True 确保日志实时输出，不卡顿
+                    if err:
+                        stats['failed_chunks'] += 1
+                        stats['errors'].append(err)
+                        print(f"   [{i + 1}/{total_c}] ❌ {err}", flush=True)
+                    else:
+                        stats['success_chunks'] += 1
+                        print(f"   [{i + 1}/{total_c}] ✅ 切片完成", flush=True)
+                        if qs:
+                            for q in qs:
+                                q['id'] = str(uuid.uuid4())
+                                q['number'] = len(all_qs) + 1
+                                q['chapter'] = fname.replace(".docx", "")
+                                q['category'] = normalize_category(q.get('category', '综合题'))
+                                if 'analysis' not in q: q['analysis'] = ""
+                                all_qs.append(q)
+            else:
+                # 本地模式：保留 tqdm 动画进度条
+                for fut in tqdm(as_completed(futures), total=total_c, ncols=80, mininterval=1.0):
+                    qs, err = fut.result()
+                    if err:
+                        stats['failed_chunks'] += 1
+                        stats['errors'].append(err)
+                        tqdm.write(f"   ❌ {err}")
+                    else:
+                        stats['success_chunks'] += 1
+                        if qs:
+                            for q in qs:
+                                q['id'] = str(uuid.uuid4())
+                                q['number'] = len(all_qs) + 1
+                                q['chapter'] = fname.replace(".docx", "")
+                                q['category'] = normalize_category(q.get('category', '综合题'))
+                                if 'analysis' not in q: q['analysis'] = ""
+                                all_qs.append(q)
 
     final = {"version": "MultiKey-V9-Stable", "subject": SUBJECT, "data": all_qs}
     with open(target_file, 'w', encoding='utf-8') as f:
@@ -318,7 +350,7 @@ def main():
 
     stats['duration'] = time.time() - st
     stats['total_questions'] = len(all_qs)
-    print(f"\n✨ 完成！提取 {len(all_qs)} 题")
+    print(f"\n✨ 完成！提取 {len(all_qs)} 题", flush=True)
     send_report(stats)
 
 
