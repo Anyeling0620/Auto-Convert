@@ -2,7 +2,7 @@ import json
 import os
 import time
 import requests
-import datetime
+import re
 from zhipuai import ZhipuAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -25,7 +25,7 @@ APP_CONFIG = load_config()
 SUBJECT = APP_CONFIG.get("subject_name", "通用学科")
 KEY_INDEX = APP_CONFIG.get("key_index", 0)
 
-# ================= 🔑 密钥逻辑 =================
+# ================= 🔑 密钥逻辑 (支持换行符) =================
 KEY_POOL_STR = os.getenv("ZHIPU_KEY_POOL", "")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
@@ -33,7 +33,8 @@ GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
 
 def get_api_key():
     if not KEY_POOL_STR: return None
-    keys = [k.strip() for k in KEY_POOL_STR.split(',') if k.strip()]
+    # 使用正则支持逗号、换行、空格分割
+    keys = [k.strip() for k in re.split(r'[,\n\s]+', KEY_POOL_STR) if k.strip()]
     if not keys: return None
     if KEY_INDEX >= len(keys): return keys[0]
     return keys[KEY_INDEX]
@@ -45,6 +46,7 @@ MAX_WORKERS = 20
 
 if not ZHIPU_API_KEY:
     print("❌ 错误：无法获取 API Key")
+    # 这里使用 exit(0) 防止 action 标红，或者 exit(1) 强制报错，看你需求
     exit(1)
 
 client = ZhipuAI(api_key=ZHIPU_API_KEY)
@@ -66,7 +68,7 @@ def send_validation_report(data):
     <div style="font-family:sans-serif; max-width:600px; padding:20px; border:1px solid #ddd; border-radius:8px;">
         <div style="border-bottom:2px solid {color}; padding-bottom:10px; margin-bottom:20px;">
             <h2 style="margin:0; color:#333;">{title}</h2>
-            <p style="color:#666; font-size:12px; margin:5px 0;">{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+            <p style="color:#666; font-size:12px; margin:5px 0;">{time.strftime('%Y-%m-%d %H:%M')}</p>
         </div>
         <div style="background:#f8f9fa; padding:10px; border-radius:4px; margin-bottom:15px; font-size:14px;">
             <p style="margin:4px 0;"><b>📚 学科:</b> {SUBJECT}</p>
@@ -79,87 +81,70 @@ def send_validation_report(data):
         </ul>
     """
 
-    # 存疑详情
     if data['doubt_list']:
-        # 只显示前 50 个题号，防止消息过长
         display_list = data['doubt_list'][:50]
         more_count = len(data['doubt_list']) - 50
         num_str = ", ".join(map(str, display_list))
         if more_count > 0: num_str += f", ... (还有 {more_count} 个)"
+        html += f"""<div style="background:#fff3cd; padding:10px; border-radius:4px; border:1px solid #ffeeba; margin-bottom:15px;"><h4 style="margin-top:0; color:#856404;">🤔 存疑题号列表</h4><p style="color:#856404; font-size:13px; word-break:break-all;">{num_str}</p></div>"""
 
-        html += f"""
-        <div style="background:#fff3cd; padding:10px; border-radius:4px; border:1px solid #ffeeba; margin-bottom:15px;">
-            <h4 style="margin-top:0; color:#856404;">🤔 存疑题号列表</h4>
-            <p style="color:#856404; font-size:13px; word-break:break-all;">{num_str}</p>
-        </div>
-        """
-
-    # API 错误详情
     if data['api_errors']:
-        html += f"""
-        <div style="background:#f8d7da; padding:10px; border-radius:4px; border:1px solid #f5c6cb;">
-            <h4 style="margin-top:0; color:#721c24;">❌ API 调用错误</h4>
-            <ul style="padding-left:20px; color:#721c24; font-size:12px;">
-                {''.join([f'<li>{e}</li>' for e in data['api_errors'][:10]])}
-            </ul>
-        </div>
-        """
+        html += f"""<div style="background:#f8d7da; padding:10px; border-radius:4px; border:1px solid #f5c6cb;"><h4 style="margin-top:0; color:#721c24;">❌ API 调用错误</h4><ul style="padding-left:20px; color:#721c24; font-size:12px;">{''.join([f'<li>{e}</li>' for e in data['api_errors'][:10]])}</ul></div>"""
 
     html += "</div>"
-
-    requests.post("http://www.pushplus.plus/send", json={
-        "token": PUSHPLUS_TOKEN, "title": f"[{SUBJECT}] 质检报告", "content": html, "template": "html"
-    }, timeout=5)
+    requests.post("http://www.pushplus.plus/send",
+                  json={"token": PUSHPLUS_TOKEN, "title": f"[{SUBJECT}] 质检报告", "content": html, "template": "html"},
+                  timeout=5)
 
 
 # ================= 🚀 校验逻辑 =================
 def validate_single(question):
-    # 构造清晰的选项文本，方便 AI 阅读
+    # 构造清晰的选项文本
     options_text = ""
     if question.get('options'):
         options_text = "\n".join([f"{opt['label']}. {opt['text']}" for opt in question['options']])
 
     prompt = f"""
-    [系统角色]
-    你是一位资深的**{SUBJECT}**学科专家和试题审核员。
-    你的任务是审核一道刚刚从文档中提取出来的题目，判断其“参考答案”是否存在明显错误。
+        [系统角色]
+        你是一位资深的**{SUBJECT}**学科专家和试题审核员。
+        你的任务是审核一道刚刚从文档中提取出来的题目，判断其“参考答案”是否存在明显错误。
 
-    [待审核题目详情]
-    --------------------------------------------------
-    【学科章节】：{question.get('chapter', '未知章节')}
-    【题型分类】：{question.get('category', '未知题型')}
-    【题目内容】：
-    {question['content']}
-    
-    【候选选项】：
-    {options_text}
-    --------------------------------------------------
+        [待审核题目详情]
+        --------------------------------------------------
+        【学科章节】：{question.get('chapter', '未知章节')}
+        【题型分类】：{question.get('category', '未知题型')}
+        【题目内容】：
+        {question['content']}
 
-    [给出的参考答案]
-    {question['answer']}
+        【候选选项】：
+        {options_text}
+        --------------------------------------------------
 
-    [审核判罚标准]
-    1. **事实性错误 (Fatal Error)**：参考答案违反了学科公理、常识或标准指南。
-       - 例如：医学中使用了禁忌药；数学中 1+1=3；计算机中死锁条件错误。
-       - 判定：必须报错。
-    2. **逻辑/格式错误 (Logic Error)**：
-       - 单选题给出了多个答案（如 "AB"）。
-       - 多选题只给了一个答案（如 "A"）。
-       - 判断题答案不是对/错。
-       - 判定：必须报错。
-    3. **主观题宽容原则**：
-       - 对于“简答题”、“论述题”、“编程题”，只要参考答案的逻辑通顺、言之有理，即视为正确。不要吹毛求疵。
+        [给出的参考答案]
+        {question['answer']}
 
-    [输出指令]
-    请仅输出以下两种格式之一，不要包含其他废话：
+        [审核判罚标准]
+        1. **事实性错误 (Fatal Error)**：参考答案违反了学科公理、常识或标准指南。
+           - 例如：医学中使用了禁忌药；数学中 1+1=3；计算机中死锁条件错误。
+           - 判定：必须报错。
+        2. **逻辑/格式错误 (Logic Error)**：
+           - 单选题给出了多个答案（如 "AB"）。
+           - 多选题只给了一个答案（如 "A"）。
+           - 判断题答案不是对/错。
+           - 判定：必须报错。
+        3. **主观题宽容原则**：
+           - 对于“简答题”、“论述题”、“编程题”，只要参考答案的逻辑通顺、言之有理，即视为正确。不要吹毛求疵。
 
-    格式 A（认为正确）：
-    CORRECT
+        [输出指令]
+        请仅输出以下两种格式之一，不要包含其他废话：
 
-    格式 B（认为存疑）：
-    DOUBT: [此处简短说明错误理由，并给出你认为的正确答案]
+        格式 A（认为正确）：
+        CORRECT
 
-    """
+        格式 B（认为存疑）：
+        DOUBT: [此处简短说明错误理由，并给出你认为的正确答案]
+
+        """
     try:
         res = client.chat.completions.create(
             model=AI_MODEL_NAME, messages=[{"role": "user", "content": prompt}],
@@ -207,7 +192,11 @@ def main():
                 pass
 
     data['data'] = questions
-    data['source'] += " + Validated"
+
+    # 【核心修复】安全地更新 source 字段
+    current_source = data.get('source', 'Unknown-Source')
+    data['source'] = current_source + " + Validated"
+
     with open(target_file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 

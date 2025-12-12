@@ -28,44 +28,54 @@ def load_config():
 APP_CONFIG = load_config()
 SUBJECT = APP_CONFIG.get("subject_name", "通用学科")
 DESC = APP_CONFIG.get("description", "")
-KEY_INDEX = APP_CONFIG.get("key_index", 0)
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
-MAX_WORKERS = APP_CONFIG.get("max_workers", 16)
 
-# ================= 🔑 环境与密钥 =================
-GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local-dev")
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "Local/Repo")
+# ================= 🔑 密钥负载均衡池 (核心升级) =================
 KEY_POOL_STR = os.getenv("ZHIPU_KEY_POOL", "")
-PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
+# 【核心修改】使用正则分割：支持 逗号、换行符、空格 混合分隔
+# r'[,\n\s]+' 意味着：只要遇到逗号、换行或空白字符，就切开
+if KEY_POOL_STR:
+    API_KEYS = [k.strip() for k in re.split(r'[,\n\s]+', KEY_POOL_STR) if k.strip()]
+else:
+    API_KEYS = []
+
+if not API_KEYS:
+    print("❌ 严重错误：ZHIPU_KEY_POOL 为空！请在 GitHub Secrets 中配置。")
+    # converter.py 用 exit(1)，validator.py 可以选择 return 或 exit
+    # 建议这里保持原脚本的处理逻辑
+    if __name__ == "__main__": exit(1)
+
+print(f"🔥 密钥池加载成功：共 {len(API_KEYS)} 个 Key")
+
+print(f"🔥 火力全开模式：已加载 {len(API_KEYS)} 个 API Key 进行负载均衡")
 
 
-def get_api_key():
-    if not KEY_POOL_STR: return None
-    keys = [k.strip() for k in KEY_POOL_STR.split(',') if k.strip()]
-    if not keys: return None
-    if KEY_INDEX >= len(keys): return keys[0]
-    return keys[KEY_INDEX]
+def get_random_client():
+    """随机抽取一个 Key 创建客户端"""
+    selected_key = random.choice(API_KEYS)
+    return ZhipuAI(api_key=selected_key), selected_key[-4:]  # 返回 client 和 key的后4位用于日志
 
 
-ZHIPU_API_KEY = get_api_key()
+# 并发数策略：Key越多，并发可以开得越大
+# 假设每个 Key 能撑住 3-5 个并发，这里动态计算
+DYNAMIC_WORKERS = len(API_KEYS) * 6
+MAX_WORKERS = APP_CONFIG.get("max_workers", DYNAMIC_WORKERS)
+# 限制最大不超过 32 (防止 GitHub Runner 内存爆)
+if MAX_WORKERS > 32: MAX_WORKERS = 32
+
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 2000;
 OVERLAP = 200;
 MAX_RETRIES = 5;
 API_TIMEOUT = 120
-
-if not ZHIPU_API_KEY:
-    print("❌ 错误：无法获取 API Key")
-    exit(1)
-
-client = ZhipuAI(api_key=ZHIPU_API_KEY)
+PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
 
 
-# ================= 📧 报表推送模块 =================
+# ================= 📧 报表推送 =================
 def send_report(data):
     if not PUSHPLUS_TOKEN: return
-
     is_success = data['failed_chunks'] == 0
     color = "#28a745" if is_success else "#dc3545"
     title = "✅ 题库生成成功" if is_success else "⚠️ 生成存在异常"
@@ -78,8 +88,8 @@ def send_report(data):
         </div>
         <div style="background:#f8f9fa; padding:10px; border-radius:4px; margin-bottom:15px; font-size:14px;">
             <p style="margin:4px 0;"><b>📚 学科:</b> {SUBJECT}</p>
-            <p style="margin:4px 0;"><b>🌿 分支:</b> {GITHUB_REF_NAME}</p>
-            <p style="margin:4px 0;"><b>🤖 模型:</b> {AI_MODEL_NAME}</p>
+            <p style="margin:4px 0;"><b>🔑 密钥池:</b> 启用 {len(API_KEYS)} 个 Key</p>
+            <p style="margin:4px 0;"><b>🚀 并发:</b> {MAX_WORKERS} 线程</p>
         </div>
         <ul style="padding-left:20px; margin-bottom:20px;">
             <li>⏱️ 耗时: <b>{data['duration']:.1f}s</b></li>
@@ -88,19 +98,17 @@ def send_report(data):
             <li>🧩 切片: 成功 {data['success_chunks']} / 失败 <b style="color:red;">{data['failed_chunks']}</b></li>
         </ul>
     """
-
     if data['errors']:
-        html += "<div style='background:#fff3cd; padding:10px; border-radius:4px; border:1px solid #ffeeba;'>"
-        html += "<h4 style='margin-top:0; color:#856404;'>⚠️ 异常详情</h4><ul style='padding-left:20px; color:#856404; font-size:13px;'>"
-        for err in data['errors']:
-            html += f"<li style='margin-bottom:4px;'>{err}</li>"
+        html += "<div style='background:#fff3cd; padding:10px; border-radius:4px; border:1px solid #ffeeba;'><h4 style='margin:0 0 10px 0; color:#856404;'>⚠️ 异常详情</h4><ul style='padding-left:20px; color:#856404; font-size:13px;'>"
+        for err in data['errors']: html += f"<li style='margin-bottom:4px;'>{err}</li>"
         html += "</ul></div>"
-
     html += "</div>"
-
-    requests.post("http://www.pushplus.plus/send", json={
-        "token": PUSHPLUS_TOKEN, "title": f"[{SUBJECT}] 生成报告", "content": html, "template": "html"
-    }, timeout=5)
+    try:
+        requests.post("http://www.pushplus.plus/send",
+                      json={"token": PUSHPLUS_TOKEN, "title": f"[{SUBJECT}] 生成报告", "content": html,
+                            "template": "html"}, timeout=5)
+    except:
+        pass
 
 
 # ================= 🛠️ 核心逻辑 =================
@@ -160,6 +168,8 @@ def repair_json(jstr):
 
 def extract_global_answers(txt):
     print("   🔍 扫描参考答案...")
+    # 抽取一个 Key 专门用来扫答案
+    client, k_id = get_random_client()
     try:
         res = client.chat.completions.create(
             model=AI_MODEL_NAME, messages=[{"role": "user", "content": "提取参考答案，纯文本列表。\n\n" + txt[:100000]}],
@@ -172,81 +182,48 @@ def extract_global_answers(txt):
 
 def process_chunk(args):
     chunk, idx, ans_key = args
+
     prompt = f"""
-        [系统角色设定]
-        你是由 Python 脚本调用的“全学科试题数据结构化引擎”。
-        **你不是聊天助手，严禁输出任何寒暄语、解释性文字或 Markdown 代码标记（如 ```json）。**
-        你的唯一任务是将输入的非结构化文本切片，精准解析为符合 Schema 定义的 JSON 数组。
+    [系统角色设定]
+    你是由 Python 脚本调用的“全学科试题数据结构化引擎”。
+    **你不是聊天助手，严禁输出任何寒暄语、解释性文字或 Markdown 代码标记（如 ```json）。**
+    你的唯一任务是将输入的非结构化文本切片，精准解析为符合 Schema 定义的 JSON 数组。
 
-        [当前处理学科]
-        - 学科名称：**{SUBJECT}**
-        - 学科背景：{DESC}
-        （请利用学科背景知识来辅助判断题型，例如：医学常出现 A1/病例分析；计算机常出现编程/算法；数学常出现证明/计算）
+    [当前处理学科]
+    - 学科名称：**{SUBJECT}**
+    - 学科背景：{DESC}
 
-        [全局上下文：参考答案库]
-        ---------------------------------------------------------------------
-        {ans_key[:5000]} ... (若过长已自动截断，仅供查阅)
-        ---------------------------------------------------------------------
+    [全局上下文：参考答案库]
+    {ans_key[:5000]}
 
-        [严格执行守则 (Chain of Constraints)]
+    [严格执行守则]
+    1. **边界截断处理**：直接丢弃切片首尾不完整段落。
+    2. **答案匹配逻辑**：优先自带 > 查表 > 留空。严禁随机生成。
+    3. **题型归一化**：医学(A1/B1/病例)，理工(编程/计算)，通用(单选/多选/判断/填空/简答)。
 
-        1. **边界截断处理 (最高优先级)**：
-           - 输入文本是长文档的一个切片。
-           - **直接丢弃**切片开头处不完整的残缺段落（例如：只有选项没有题干）。
-           - **直接丢弃**切片末尾处不完整的残缺段落（例如：只有题干没有选项）。
-           - 只提取中间语义完整的题目。
+    [输出格式规范 (JSON Schema)]
+    必须返回 JSON Array：
+    [
+      {{
+        "category": "String",
+        "type": "Enum (SINGLE_CHOICE / MULTI_CHOICE / TRUE_FALSE / FILL_BLANK / ESSAY)",
+        "content": "String",
+        "options": [{{"label": "A", "text": "..."}}],
+        "answer": "String",
+        "analysis": "String"
+      }}
+    ]
 
-        2. **答案匹配逻辑 (三级瀑布流)**：
-           - **Level 1 (自带)**：优先提取题目文本内部自带的答案（例如：括号内的字母、题干末尾的答案、选项下方的“【答案】”）。
-           - **Level 2 (查表)**：提取题目中的【题号】（如 "53."），去上方的 [参考答案库] 中查找对应题号的答案。
-           - **Level 3 (留空)**：如果 Level 1 和 Level 2 都失败，`answer` 字段必须留空字符串 ""。**严禁根据题目内容自己做题！严禁随机生成！**
-
-        3. **文本清洗规则**：
-           - **Content 清洗**：移除题干开头的题号（例如："1. 下列哪项..." -> "下列哪项..."）。
-           - **Option 清洗**：移除选项开头的标签（例如："A. 阿司匹林" -> label:"A", text:"阿司匹林"）。
-           - **特殊符号**：保留代码块、数学公式（LaTeX）、化学式原本的格式，不要随意转义。
-
-        4. **题型归一化映射 (Category Mapping)**：
-           - **医学专用**：
-             * 5个选项(A-E)单选 -> "A1型题" 或 "A2型题"
-             * 共用题干/配伍 -> "B1型题"
-             * 多选题 -> "X型题"
-             * 病例描述/诊断 -> "病例分析题"
-           - **理工/计算机专用**：
-             * 代码补全/算法实现 -> "编程题"
-             * 数值计算/公式推导 -> "计算题"
-             * 逻辑证明 -> "证明题"
-             * 系统设计/应用场景 -> "应用题"
-           - **通用基础**：
-             * 4个选项单选 -> "单选题"
-             * 多个正确答案/不定项 -> "多选题"
-             * 对/错, T/F -> "判断题"
-             * 下划线/括号填空 -> "填空题"
-             * 无选项主观问答 -> "简答题"
-             * 名词解释 -> "名词解释题"
-
-        [输出格式规范 (JSON Schema)]
-        必须返回一个纯净的 JSON Array，包含以下字段：
-        [
-          {{
-            "category": "String (必须是上述映射表中的标准名称)",
-            "type": "Enum (SINGLE_CHOICE / MULTI_CHOICE / TRUE_FALSE / FILL_BLANK / ESSAY)",
-            "content": "String (清洗后的完整题干)",
-            "options": [
-               {{"label": "A", "text": "选项内容..."}},
-               {{"label": "B", "text": "选项内容..."}}
-            ],
-            "answer": "String (例如 'A', 'ABC', 'True', 'void main()...')",
-            "analysis": "String (如果文本中有解析则提取，否则留空)"
-          }}
-        ]
-
-        [待处理文本切片]
-        {chunk}
-        """
+    [待处理文本切片]
+    {chunk}
+    """
 
     last_err = ""
     for i in range(MAX_RETRIES):
+        # 【关键升级】每次重试都重新换一个随机账号！
+        # 这样如果 Key A 没额度了，立刻换 Key B，极大降低失败率
+        client, k_id = get_random_client()
+
         try:
             res = client.chat.completions.create(
                 model=AI_MODEL_NAME, messages=[{"role": "user", "content": prompt}],
@@ -262,7 +239,8 @@ def process_chunk(args):
                 continue
         except Exception as e:
             last_err = str(e)
-            time.sleep((2 ** i) + random.random())
+            # 指数退避 (换了 Key 所以等待时间可以缩短)
+            time.sleep(1 + random.random())
 
     return [], f"Chunk {idx + 1} 失败 (API: {last_err})"
 
@@ -281,7 +259,7 @@ def main():
         if m: next_idx = max(next_idx, int(m.group(1)) + 1)
     target_file = os.path.join(OUTPUT_DIR, f"output{next_idx}.json")
 
-    print(f"🚀 [{SUBJECT}] 启动 | 分支: {GITHUB_REF_NAME}")
+    print(f"🚀 [{SUBJECT}] 全速启动 | Key池: {len(API_KEYS)}个 | 并发: {MAX_WORKERS}")
 
     all_qs = []
     stats = {"file_count": len(files), "total_chunks": 0, "success_chunks": 0, "failed_chunks": 0, "errors": []}
@@ -314,7 +292,7 @@ def main():
                             if 'analysis' not in q: q['analysis'] = ""
                             all_qs.append(q)
 
-    final = {"version": "V7-Report", "subject": SUBJECT, "data": all_qs}
+    final = {"version": "MultiKey-V8", "subject": SUBJECT, "data": all_qs}
     with open(target_file, 'w', encoding='utf-8') as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
     with open("last_generated_file.txt", "w") as f:
