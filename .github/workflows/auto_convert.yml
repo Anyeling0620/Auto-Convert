@@ -30,7 +30,7 @@ jobs:
           # 【核心】直接把整个密钥池传进去
           ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python scripts/converter.py
+        run: python -u scripts/converter.py
 
       - name: 2. Validate Answers (Validator)
         env:
