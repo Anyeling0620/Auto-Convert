@@ -1,25 +1,24 @@
 name: Sync Main to All Branches
 
-# 触发条件：当 main 分支有代码推送到 github 时
 on:
   push:
     branches:
       - main
     paths-ignore:
       - 'README.md'
-      - '.github/workflows/**' # 防止修改workflow本身导致死循环
+      - '.github/workflows/**'
 
 jobs:
   sync-branches:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写权限，否则无法 push
+      contents: write
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 关键：必须拉取所有历史记录和分支信息，不能只拉取 main
+          fetch-depth: 0
 
       - name: Configure Git User
         run: |
@@ -28,52 +27,73 @@ jobs:
 
       - name: Sync Main to Other Branches
         run: |
-          # 1. 获取所有远程分支列表，过滤掉 main 和 HEAD
-          # origin/med -> med
+          # 获取除了 main 以外的所有远程分支
           branches=$(git branch -r | grep -v '\->' | grep -v 'origin/main' | sed 's/origin\///' | xargs)
           
-          echo "检测到需要同步的分支: $branches"
+          if [ -z "$branches" ]; then
+            echo "⚠️ 未发现其他分支，跳过同步。"
+            exit 0
+          fi
 
-          # 2. 遍历每个分支
+          echo "检测到目标分支: $branches"
+
           for branch in $branches; do
-            echo "----------------------------------------------"
-            echo "🚀 正在同步 main -> $branch ..."
+            echo "=============================================="
+            echo "🚀 正在同步: main -> $branch"
             
-            # 切换到该分支（并建立追踪关系）
             git checkout $branch
             
-            # 尝试合并 main，参数 --no-commit 让我们可以有机会修改文件
-            # --no-ff 保证生成合并记录
-            echo "正在合并代码..."
+            # 1. 尝试合并 main (不自动提交，方便我们修改文件)
+            # --no-commit: 给我们机会处理文件
+            # --no-ff: 保持提交历史清晰
             git merge origin/main --no-commit --no-ff || true
             
+            echo "🛡️ 执行【数据防火墙】策略..."
+
             # =======================================================
-            # 🛡️【核心魔法】保护 config.json 不被覆盖
+            # 策略 1: 保护 config.json
             # =======================================================
-            # 逻辑：无论 main 里的 config.json 变成了什么样，
-            # 我们强制把暂存区的 config.json 恢复成当前分支(HEAD)的版本。
-            # 如果文件不存在（比如新分支），则忽略错误。
-            
-            if [ -f config.json ]; then
-                echo "🛡️ 正在保护 $branch 的 config.json ..."
+            # 逻辑：强制将 config.json 恢复成当前分支(HEAD)的版本
+            if git rev-parse --verify HEAD:config.json >/dev/null 2>&1; then
+                echo "   - 恢复当前分支的 config.json"
                 git checkout HEAD -- config.json
+            else
+                echo "   - 当前分支无 config.json，保持原样"
             fi
             
+            # =======================================================
+            # 策略 2: 保护 input/ 和 output/ (完全隔离)
+            # =======================================================
+            # 逻辑：
+            # A. 先把合并进来的 input/output 全部从暂存区删除 (拒绝 Main 的数据)
+            #    这一步是为了防止 Main 里有新文件被意外加进来
+            git rm -rfq input output || true
+            
+            # B. 再从当前分支(HEAD) 恢复原本的数据 (如果有的话)
+            #    这一步是为了防止 Main 删除了文件导致我们也丢文件
+            git checkout HEAD -- input output 2>/dev/null || true
+            
+            # C. 确保文件夹结构存在 (如果不复存在，则新建)
+            #    这是为了满足“如果没有则新建”的需求
+            mkdir -p input output
+            
+            # D. 放入 .gitkeep 占位符并追踪，防止空文件夹无法提交
+            touch input/.gitkeep output/.gitkeep
+            git add input/.gitkeep output/.gitkeep
+            
+            echo "   - 数据文件夹已隔离并重置"
             # =======================================================
 
             # 检查是否有变更需要提交
             if git diff --cached --quiet; then
-              echo "✅ 没有代码变更（已经是最新），跳过。"
+              echo "✅ $branch 已经是最新，无需提交。"
             else
-              # 提交合并结果
               echo "📝 提交更改..."
-              git commit -m "Sync: Merge updates from main (keeping local config)"
+              git commit -m "Sync: Update code from main (Data & Config Protected)"
               
-              # 推送回远程
-              echo "☁️ 推送到远程 $branch..."
+              echo "☁️ 推送 $branch ..."
               git push origin $branch
             fi
             
-            echo "✅ $branch 同步完成！"
-            echo ""
+            echo "✅ $branch 处理完毕"
           done
