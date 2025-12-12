@@ -62,13 +62,13 @@ def get_random_client():
 DYNAMIC_WORKERS = len(API_KEYS) * 6
 MAX_WORKERS = APP_CONFIG.get("max_workers", DYNAMIC_WORKERS)
 # 限制最大不超过 32 (防止 GitHub Runner 内存爆)
-if MAX_WORKERS > 32: MAX_WORKERS = 32
+if MAX_WORKERS > 48: MAX_WORKERS = 48
 
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 2000;
 OVERLAP = 200;
 MAX_RETRIES = 5;
-API_TIMEOUT = 120
+API_TIMEOUT = 40
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
 
@@ -220,11 +220,11 @@ def process_chunk(args):
 
     last_err = ""
     for i in range(MAX_RETRIES):
-        # 【关键升级】每次重试都重新换一个随机账号！
-        # 这样如果 Key A 没额度了，立刻换 Key B，极大降低失败率
+        # 每次重试都换号
         client, k_id = get_random_client()
 
         try:
+            # 缩短后的超时时间
             res = client.chat.completions.create(
                 model=AI_MODEL_NAME, messages=[{"role": "user", "content": prompt}],
                 temperature=0.1, top_p=0.7, max_tokens=4000, timeout=API_TIMEOUT
@@ -234,16 +234,22 @@ def process_chunk(args):
                 data = json.loads(content)
                 if isinstance(data, list): return data, None
                 if isinstance(data, dict): return [data], None
-                return [], f"Chunk {idx + 1}: JSON格式异常"
-            except:
-                continue
+                raise ValueError("JSON格式异常")  # 抛出异常进入 except
+            except Exception as e:
+                # 显式抛出 JSON 错误，触发重试
+                raise ValueError(f"JSON解析失败: {str(e)}")
+
         except Exception as e:
             last_err = str(e)
-            # 指数退避 (换了 Key 所以等待时间可以缩短)
+            # 【关键修改】使用 tqdm.write 打印日志，不会破坏进度条
+            # 只有在耗时较长（第2次重试以后）才显示，避免刷屏
+            if i >= 1:
+                tqdm.write(f"   ⚠️ Chunk {idx + 1} 遇阻 (Key...{k_id}): {str(e)[:50]}... -> 正在第 {i + 1} 次换号重试")
+
+            # 指数退避
             time.sleep(1 + random.random())
 
-    return [], f"Chunk {idx + 1} 失败 (API: {last_err})"
-
+    return [], f"Chunk {idx + 1} 彻底失败 (API: {last_err})"
 
 def main():
     st = time.time()
