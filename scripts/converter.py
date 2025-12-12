@@ -50,7 +50,6 @@ def get_random_client():
     selected_key = random.choice(API_KEYS)
     return ZhipuAI(api_key=selected_key), selected_key[-4:]
 
-# 添加一行只是为了同步
 # ================= ⚙️ 性能策略优化 (关键修改) =================
 
 # 1. 并发数调整：保守策略
