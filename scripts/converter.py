@@ -62,7 +62,7 @@ def get_random_client():
 DYNAMIC_WORKERS = len(API_KEYS) * 6
 MAX_WORKERS = APP_CONFIG.get("max_workers", DYNAMIC_WORKERS)
 # 限制最大不超过 32 (防止 GitHub Runner 内存爆)
-if MAX_WORKERS > 48: MAX_WORKERS = 48
+if MAX_WORKERS > 32: MAX_WORKERS = 32
 
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 2000;
