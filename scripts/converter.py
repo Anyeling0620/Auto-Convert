@@ -6,6 +6,9 @@ import requests
 import random
 import re
 import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
 from docx import Document
 from zhipuai import ZhipuAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +33,19 @@ SUBJECT = APP_CONFIG.get("subject_name", "通用学科")
 DESC = APP_CONFIG.get("description", "")
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
+
+# 📧 邮件配置 (请在 GitHub Secrets 或 环境变量中配置)
+# 如果没有配置，脚本会自动跳过邮件发送
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.163.com")  # =smtp.163.com
+SMTP_PORT = int(os.getenv("SMTP_PORT", 465))        # SSL端口通常是 465
+SMTP_USER = os.getenv("SMTP_USER")                  # 发送方邮箱账号
+SMTP_PASS = os.getenv("SMTP_PASS")                  # 发送方邮箱授权码
+RECEIVER_EMAILS_STR = os.getenv("RECEIVER_EMAILS", "")
+if RECEIVER_EMAILS_STR:
+    # 使用正则切分，兼容 Windows/Linux 换行符，逗号等
+    RECEIVER_EMAILS = [e.strip() for e in re.split(r'[,\n\s]+', RECEIVER_EMAILS_STR) if e.strip()]
+else:
+    RECEIVER_EMAILS = []
 
 # ================= 🔑 密钥负载均衡池 (核心升级) =================
 KEY_POOL_STR = os.getenv("ZHIPU_KEY_POOL", "")
@@ -56,22 +72,99 @@ def get_random_client():
 # 即使有11个Key，也不要开16并发。建议比例 1:0.5 (2个Key养1个线程)
 # 这样能确保当一个Key被限流时，还有充裕的空闲Key可用
 calculated_workers = max(1, len(API_KEYS) // 2)
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 # 强制封顶，防止 GitHub Action 内存溢出或被 API 服务商封锁
 if MAX_WORKERS > 16: MAX_WORKERS = 16
 
 # 2. 超时与重试调整
 # 减少重试次数，增加单次等待耐心
 AI_MODEL_NAME = "glm-4-flash"
-CHUNK_SIZE = 800
+CHUNK_SIZE = 1000
 OVERLAP = 100
-MAX_RETRIES = 2  # ⬇️ 降级：从5次改为3次 (Fail fast)
+MAX_RETRIES = 5  # ⬇️ 降级：从5次改为3次 (Fail fast)
 API_TIMEOUT = 60  # ⬆️ 升级：从40s改为60s (给AI更多思考时间，减少伪性超时)
 RETRY_DELAY = 1  # ⬆️ 新增：重试前的冷却时间 (秒)
 
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
 
+# ================= 📝 全局日志记录器 =================
+EXECUTION_LOGS = []
+
+
+def log_record(msg, level="INFO"):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    icon = "✅" if level == "INFO" else "❌" if level == "ERROR" else "⚠️"
+    print(f"[{timestamp}] {icon} {msg}", flush=True)
+
+    color = "#333"
+    if level == "ERROR": color = "red"
+    if level == "WARN": color = "#d35400"
+    if "Chunk" in msg and level == "INFO": color = "green"
+    log_line = f"<div style='color:{color}; border-bottom:1px dashed #eee; padding:4px 0;'>[{timestamp}] {msg}</div>"
+    EXECUTION_LOGS.append(log_line)
+
+
+# ================= 📤 发送模块 (支持群发) =================
+def generate_html_report(data):
+    is_success = data['failed_chunks'] == 0
+    color = "#28a745" if is_success else "#dc3545"
+    title = "✅ 题库生成成功" if is_success else "⚠️ 生成存在异常"
+
+    log_html = "".join(EXECUTION_LOGS)
+
+    html = f"""
+    <div style="font-family:sans-serif; max-width:600px; padding:20px; border:1px solid #ddd; border-radius:8px;">
+        <div style="border-bottom:2px solid {color}; padding-bottom:10px; margin-bottom:20px;">
+            <h2 style="margin:0; color:#333;">{title}</h2>
+            <p style="color:#666; font-size:12px; margin:5px 0;">{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        </div>
+        <div style="background:#f8f9fa; padding:10px; border-radius:4px; margin-bottom:15px; font-size:14px;">
+            <p style="margin:4px 0;"><b>📚 学科:</b> {SUBJECT}</p>
+            <p style="margin:4px 0;"><b>🔑 密钥池:</b> {len(API_KEYS)} 个</p>
+            <p style="margin:4px 0;"><b>🚀 状态:</b> {data['success_chunks']} 成功 / <span style="color:red">{data['failed_chunks']} 失败</span></p>
+            <p style="margin:4px 0;"><b>⏱️ 总耗时:</b> {data['duration']:.1f}s</p>
+            <p style="margin:4px 0;"><b>📝 题目数:</b> {data['total_questions']}</p>
+        </div>
+
+        <h4 style="margin:10px 0;">📜 运行日志 (滚动查看)</h4>
+        <div style="background:#fafafa; border:1px solid #eee; height:300px; overflow-y:auto; padding:10px; font-size:12px; font-family:monospace;">
+            {log_html}
+        </div>
+    </div>
+    """
+    return title, html
+
+
+def send_email(title, content):
+    if not SMTP_USER or not SMTP_PASS:
+        print("⚠️ 未配置 SMTP，跳过发送邮件", flush=True)
+        return
+
+    if not RECEIVER_EMAILS:
+        print("⚠️ 未配置接收邮箱 (RECEIVER_EMAILS)，跳过发送", flush=True)
+        return
+
+    try:
+        # 建立一次连接，循环发送
+        smtp_obj = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+        smtp_obj.login(SMTP_USER, SMTP_PASS)
+
+        for email in RECEIVER_EMAILS:
+            try:
+                message = MIMEText(content, 'html', 'utf-8')
+                message['From'] = Header(f"题库助手 <{SMTP_USER}>", 'utf-8')
+                message['To'] = Header(email, 'utf-8')
+                message['Subject'] = Header(title, 'utf-8')
+
+                smtp_obj.sendmail(SMTP_USER, [email], message.as_string())
+                print(f"✅ 邮件已发送至 {email}", flush=True)
+            except Exception as e:
+                print(f"❌ 发送至 {email} 失败: {e}", flush=True)
+
+        smtp_obj.quit()
+    except Exception as e:
+        print(f"❌ 邮件服务连接失败: {e}", flush=True)
 
 # ================= 📧 报表推送 =================
 def send_report(data):
@@ -110,6 +203,14 @@ def send_report(data):
     except:
         pass
 
+def send_pushplus(title, content):
+    if not PUSHPLUS_TOKEN: return
+    try:
+        requests.post("http://www.pushplus.plus/send",
+                      json={"token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "html"}, timeout=5)
+        print("✅ PushPlus 推送成功", flush=True)
+    except Exception as e:
+        print(f"❌ PushPlus 推送失败: {e}", flush=True)
 
 # ================= 🛠️ 核心逻辑 =================
 def read_docx(file_path):
@@ -275,82 +376,53 @@ def main():
         if m: next_idx = max(next_idx, int(m.group(1)) + 1)
     target_file = os.path.join(OUTPUT_DIR, f"output{next_idx}.json")
 
-    # 检测是否在 GitHub Actions 环境中运行
-    IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
-
-    print(f"🚀 [{SUBJECT}] 启动 | Key池: {len(API_KEYS)} | 并发: {MAX_WORKERS}")
+    log_record(f"🚀 [{SUBJECT}] 启动 | Key: {len(API_KEYS)} | 并发: {MAX_WORKERS}")
+    if RECEIVER_EMAILS:
+        log_record(f"📧 邮件将发送给: {len(RECEIVER_EMAILS)} 位接收者")
 
     all_qs = []
-    stats = {"file_count": len(files), "total_chunks": 0, "success_chunks": 0, "failed_chunks": 0, "errors": []}
+    stats = {"file_count": len(files), "total_chunks": 0, "success_chunks": 0, "failed_chunks": 0}
 
     for fname in files:
-        # 强制刷新缓冲区，确保文件名立即打印
-        print(f"\n📄 {fname}", flush=True)
+        log_record(f"📄 处理文件: {fname}")
         txt = read_docx(os.path.join(INPUT_DIR, fname))
         if not txt: continue
 
-        # ❌ 彻底禁用阻塞式答案扫描
-        ans = ""
-
         chunks = get_chunks(txt, CHUNK_SIZE, OVERLAP)
-
-        # ✅ 【关键修正】在这里定义 total_c
+        stats['total_chunks'] += len(chunks)
         total_c = len(chunks)
-        stats['total_chunks'] += total_c
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exc:
-            futures = [exc.submit(process_chunk, (c, i, ans)) for i, c in enumerate(chunks)]
+            futures = [exc.submit(process_chunk, (c, i, "")) for i, c in enumerate(chunks)]
 
-            # === 分支处理：CI环境用普通打印，本地用进度条 ===
-            if IN_GITHUB_ACTIONS:
-                # GitHub Actions 模式：纯文本日志，无进度条
-                for i, fut in enumerate(as_completed(futures)):
-                    qs, err = fut.result()
-                    # flush=True 确保日志实时输出，不卡顿
-                    if err:
-                        stats['failed_chunks'] += 1
-                        stats['errors'].append(err)
-                        print(f"   [{i + 1}/{total_c}] ❌ {err}", flush=True)
-                    else:
-                        stats['success_chunks'] += 1
-                        print(f"   [{i + 1}/{total_c}] ✅ 切片完成", flush=True)
-                        if qs:
-                            for q in qs:
-                                q['id'] = str(uuid.uuid4())
-                                q['number'] = len(all_qs) + 1
-                                q['chapter'] = fname.replace(".docx", "")
-                                q['category'] = normalize_category(q.get('category', '综合题'))
-                                if 'analysis' not in q: q['analysis'] = ""
-                                all_qs.append(q)
-            else:
-                # 本地模式：保留 tqdm 动画进度条
-                for fut in tqdm(as_completed(futures), total=total_c, ncols=80, mininterval=1.0):
-                    qs, err = fut.result()
-                    if err:
-                        stats['failed_chunks'] += 1
-                        stats['errors'].append(err)
-                        tqdm.write(f"   ❌ {err}")
-                    else:
-                        stats['success_chunks'] += 1
-                        if qs:
-                            for q in qs:
-                                q['id'] = str(uuid.uuid4())
-                                q['number'] = len(all_qs) + 1
-                                q['chapter'] = fname.replace(".docx", "")
-                                q['category'] = normalize_category(q.get('category', '综合题'))
-                                if 'analysis' not in q: q['analysis'] = ""
-                                all_qs.append(q)
+            for i, fut in enumerate(as_completed(futures)):
+                qs, err, msg = fut.result()
+                if err:
+                    stats['failed_chunks'] += 1
+                    log_record(f"[{i + 1}/{total_c}] ❌ {err}", "ERROR")
+                else:
+                    stats['success_chunks'] += 1
+                    log_record(f"[{i + 1}/{total_c}] {msg}")
+                    if qs:
+                        for q in qs:
+                            q['id'] = str(uuid.uuid4());
+                            q['number'] = len(all_qs) + 1
+                            q['chapter'] = fname.replace(".docx", "");
+                            q['category'] = normalize_category(q.get('category', '综合题'))
+                            if 'analysis' not in q: q['analysis'] = ""
+                            all_qs.append(q)
 
-    final = {"version": "MultiKey-V9-Stable", "subject": SUBJECT, "data": all_qs}
+    final = {"version": "MultiKey-V12-EmailGroup", "subject": SUBJECT, "data": all_qs}
     with open(target_file, 'w', encoding='utf-8') as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
-    with open("last_generated_file.txt", "w") as f:
-        f.write(target_file)
 
     stats['duration'] = time.time() - st
     stats['total_questions'] = len(all_qs)
-    print(f"\n✨ 完成！提取 {len(all_qs)} 题", flush=True)
-    send_report(stats)
+    log_record(f"✨ 完成! 耗时 {stats['duration']:.1f}s, 提取 {len(all_qs)} 题")
+
+    title, html = generate_html_report(stats)
+    send_pushplus(title, html)
+    send_email(title, html)
 
 
 if __name__ == "__main__": main()
