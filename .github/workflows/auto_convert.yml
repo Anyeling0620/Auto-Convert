@@ -17,11 +17,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
@@ -39,8 +34,8 @@ jobs:
 
       - name: Commit Result
         run: |
-          git config --global user.name "Pool-Bot"
-          git config --global user.email "bot@factory.com"
+          git config --global user.name "Anyeling0620"
+          git config --global user.email "3463645195@qq.com"
           
           git add output/*.json
           git commit -m "Auto-gen output [skip ci]" || echo "No changes"
