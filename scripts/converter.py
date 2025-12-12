@@ -11,9 +11,8 @@ from zhipuai import ZhipuAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ================= 配置加载 =================
+# ================= 🛡️ 智能配置加载模块 =================
 CONFIG_FILE = "config.json"
-DEFAULT_CONFIG = {"subject_name": "通用", "description": ""}
 
 
 def load_config():
@@ -23,30 +22,59 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return DEFAULT_CONFIG
+    return {}
 
 
 APP_CONFIG = load_config()
-SUBJECT = APP_CONFIG.get("subject_name", "通用")
+SUBJECT = APP_CONFIG.get("subject_name", "通用学科")
 DESC = APP_CONFIG.get("description", "")
+KEY_INDEX = APP_CONFIG.get("key_index", 0)  # 【核心】获取索引，默认用第一个
 
-# ================= 全速配置 =================
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
+MAX_WORKERS = APP_CONFIG.get("max_workers", 16)
 
-ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
+# ================= 🔑 密钥池解析逻辑 =================
+# 读取环境变量里的整个字符串
+KEY_POOL_STR = os.getenv("ZHIPU_KEY_POOL", "")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 
+
+def get_api_key():
+    """根据 Config 里的 index 从环境变量池中提取 Key"""
+    if not KEY_POOL_STR:
+        print("❌ 错误：环境变量 ZHIPU_KEY_POOL 未设置或为空！")
+        return None
+
+    # 按逗号切割
+    keys = [k.strip() for k in KEY_POOL_STR.split(',') if k.strip()]
+
+    if not keys:
+        print("❌ 错误：密钥池中没有有效的 Key！")
+        return None
+
+    # 检查索引是否越界
+    if KEY_INDEX >= len(keys):
+        print(f"⚠️ 警告：config.json 请求第 {KEY_INDEX} 个 Key，但池子里只有 {len(keys)} 个。")
+        print(f"🔄 自动回滚使用第 1 个 Key。")
+        return keys[0]
+
+    print(f"🔑 已从池中选中第 {KEY_INDEX} 个 Key (Index {KEY_INDEX}) 进行工作。")
+    return keys[KEY_INDEX]
+
+
+# 获取最终的 Key
+ZHIPU_API_KEY = get_api_key()
+
 AI_MODEL_NAME = "glm-4-flash"
-MAX_WORKERS = 16  # 【全速】独享账号直接拉高并发
 CHUNK_SIZE = 2000
 OVERLAP = 200
 MAX_RETRIES = 5
 API_TIMEOUT = 120
-# ===========================================
+# =======================================================
 
 if not ZHIPU_API_KEY:
-    print("❌ 严重错误：未找到 ZHIPU_API_KEY")
+    print("❌ 严重错误：无法获取有效的 ZHIPU_API_KEY，脚本终止。")
     exit(1)
 
 client = ZhipuAI(api_key=ZHIPU_API_KEY)

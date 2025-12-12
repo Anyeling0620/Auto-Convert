@@ -1,13 +1,14 @@
-name: Auto Convert & Validate
+name: Pool-Based Factory
 
 on:
   push:
     paths:
       - 'input/**.docx'
+      - 'scripts/**.py'
   workflow_dispatch:
 
 jobs:
-  convert_and_validate:
+  produce:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -24,23 +25,25 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: 1. Generate (Converter)
+      - name: 1. Generate Questions (Converter)
         env:
-          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          # 【核心】直接把整个密钥池传进去
+          ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python scripts/converter.py
 
-      - name: 2. Validate (Validator)
+      - name: 2. Validate Answers (Validator)
         env:
-          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
         run: python scripts/validator.py
 
       - name: Commit Result
         run: |
-          git config --global user.name "GLM-Bot"
-          git config --global user.email "bot@zhipuai.cn"
-          # 注意：这里 add output/ 会自动把 output1.json, output2.json 都加进去
+          git config --global user.name "Pool-Bot"
+          git config --global user.email "bot@factory.com"
+          
           git add output/*.json
-          git commit -m "Auto-gen output" || echo "No changes"
-          git pull origin main --rebase
-          git push origin main
+          git commit -m "Auto-gen output [skip ci]" || echo "No changes"
+          
+          git pull origin ${{ github.ref_name }} --rebase
+          git push origin ${{ github.ref_name }}
