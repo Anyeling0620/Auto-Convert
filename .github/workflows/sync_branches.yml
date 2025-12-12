@@ -1,0 +1,79 @@
+name: Sync Main to All Branches
+
+# 触发条件：当 main 分支有代码推送到 github 时
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - '.github/workflows/**' # 防止修改workflow本身导致死循环
+
+jobs:
+  sync-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须赋予写权限，否则无法 push
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 关键：必须拉取所有历史记录和分支信息，不能只拉取 main
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name "Sync-Bot"
+          git config --global user.email "bot@factory.com"
+
+      - name: Sync Main to Other Branches
+        run: |
+          # 1. 获取所有远程分支列表，过滤掉 main 和 HEAD
+          # origin/med -> med
+          branches=$(git branch -r | grep -v '\->' | grep -v 'origin/main' | sed 's/origin\///' | xargs)
+          
+          echo "检测到需要同步的分支: $branches"
+
+          # 2. 遍历每个分支
+          for branch in $branches; do
+            echo "----------------------------------------------"
+            echo "🚀 正在同步 main -> $branch ..."
+            
+            # 切换到该分支（并建立追踪关系）
+            git checkout $branch
+            
+            # 尝试合并 main，参数 --no-commit 让我们可以有机会修改文件
+            # --no-ff 保证生成合并记录
+            echo "正在合并代码..."
+            git merge origin/main --no-commit --no-ff || true
+            
+            # =======================================================
+            # 🛡️【核心魔法】保护 config.json 不被覆盖
+            # =======================================================
+            # 逻辑：无论 main 里的 config.json 变成了什么样，
+            # 我们强制把暂存区的 config.json 恢复成当前分支(HEAD)的版本。
+            # 如果文件不存在（比如新分支），则忽略错误。
+            
+            if [ -f config.json ]; then
+                echo "🛡️ 正在保护 $branch 的 config.json ..."
+                git checkout HEAD -- config.json
+            fi
+            
+            # =======================================================
+
+            # 检查是否有变更需要提交
+            if git diff --cached --quiet; then
+              echo "✅ 没有代码变更（已经是最新），跳过。"
+            else
+              # 提交合并结果
+              echo "📝 提交更改..."
+              git commit -m "Sync: Merge updates from main (keeping local config)"
+              
+              # 推送回远程
+              echo "☁️ 推送到远程 $branch..."
+              git push origin $branch
+            fi
+            
+            echo "✅ $branch 同步完成！"
+            echo ""
+          done
