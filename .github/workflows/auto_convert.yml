@@ -17,15 +17,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
-
       - name: 1. Generate Questions (Converter)
         env:
           # 【核心】直接把整个密钥池传进去
           ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python -u scripts/converter.py
+        run: python3.9 -u scripts/converter.py
 
       - name: 2. Validate Answers (Validator)
         env:
