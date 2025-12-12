@@ -57,18 +57,18 @@ def get_random_client():
 # 即使有11个Key，也不要开16并发。建议比例 1:0.5 (2个Key养1个线程)
 # 这样能确保当一个Key被限流时，还有充裕的空闲Key可用
 calculated_workers = max(1, len(API_KEYS) // 2)
-MAX_WORKERS = APP_CONFIG.get("max_workers", calculated_workers)
+MAX_WORKERS = 4
 # 强制封顶，防止 GitHub Action 内存溢出或被 API 服务商封锁
 if MAX_WORKERS > 8: MAX_WORKERS = 8
 
 # 2. 超时与重试调整
 # 减少重试次数，增加单次等待耐心
 AI_MODEL_NAME = "glm-4-flash"
-CHUNK_SIZE = 2000
-OVERLAP = 200
-MAX_RETRIES = 3  # ⬇️ 降级：从5次改为3次 (Fail fast)
-API_TIMEOUT = 60  # ⬆️ 升级：从40s改为60s (给AI更多思考时间，减少伪性超时)
-RETRY_DELAY = 3  # ⬆️ 新增：重试前的冷却时间 (秒)
+CHUNK_SIZE = 1500
+OVERLAP = 100
+MAX_RETRIES = 2  # ⬇️ 降级：从5次改为3次 (Fail fast)
+API_TIMEOUT = 30  # ⬆️ 升级：从40s改为60s (给AI更多思考时间，减少伪性超时)
+RETRY_DELAY = 1  # ⬆️ 新增：重试前的冷却时间 (秒)
 
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
