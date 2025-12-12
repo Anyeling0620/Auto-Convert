@@ -59,10 +59,10 @@ def get_random_client():
 
 # 并发数策略：Key越多，并发可以开得越大
 # 假设每个 Key 能撑住 3-5 个并发，这里动态计算
-DYNAMIC_WORKERS = len(API_KEYS) * 6
+DYNAMIC_WORKERS = len(API_KEYS) * 4
 MAX_WORKERS = APP_CONFIG.get("max_workers", DYNAMIC_WORKERS)
 # 限制最大不超过 32 (防止 GitHub Runner 内存爆)
-if MAX_WORKERS > 26: MAX_WORKERS = 26
+if MAX_WORKERS > 16: MAX_WORKERS = 16
 
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 2000;
@@ -297,7 +297,7 @@ def process_chunk(args):
                 f"   {err_type} Chunk {idx + 1} (Key..{k_id}): {str(e)[:40]}... -> 正在第 {i + 1} 次换号重试 (已耗时 {cost:.1f}s)")
 
             # 疯狗模式：不睡觉，直接换号
-            time.sleep(0.5)
+            time.sleep(0.2)
 
     return [], f"Chunk {idx + 1} 彻底失败 (API: {last_err})"
 
@@ -331,7 +331,9 @@ def main():
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exc:
             futures = [exc.submit(process_chunk, (c, i, ans)) for i, c in enumerate(chunks)]
-            for fut in tqdm(as_completed(futures), total=len(chunks)):
+            # mininterval=2.0: 每2秒才刷新一次，减少日志垃圾
+            # ncols=80: 固定宽度，防止在云端因为检测不到屏幕宽度而排版错乱
+            for fut in tqdm(as_completed(futures), total=len(chunks), mininterval=2.0, ncols=80):
                 qs, err = fut.result()
                 if err:
                     stats['failed_chunks'] += 1
