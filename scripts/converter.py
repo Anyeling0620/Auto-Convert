@@ -59,16 +59,16 @@ def get_random_client():
 calculated_workers = max(1, len(API_KEYS) // 2)
 MAX_WORKERS = APP_CONFIG.get("max_workers", calculated_workers)
 # 强制封顶，防止 GitHub Action 内存溢出或被 API 服务商封锁
-if MAX_WORKERS > 8: MAX_WORKERS = 8
+if MAX_WORKERS > 16: MAX_WORKERS = 16
 
 # 2. 超时与重试调整
 # 减少重试次数，增加单次等待耐心
 AI_MODEL_NAME = "glm-4-flash"
 CHUNK_SIZE = 2000
 OVERLAP = 200
-MAX_RETRIES = 3  # ⬇️ 降级：从5次改为3次 (Fail fast)
+MAX_RETRIES = 5  # ⬇️ 降级：从5次改为3次 (Fail fast)
 API_TIMEOUT = 60  # ⬆️ 升级：从40s改为60s (给AI更多思考时间，减少伪性超时)
-RETRY_DELAY = 3  # ⬆️ 新增：重试前的冷却时间 (秒)
+RETRY_DELAY = 1  # ⬆️ 新增：重试前的冷却时间 (秒)
 
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local")
@@ -286,7 +286,8 @@ def main():
         txt = read_docx(os.path.join(INPUT_DIR, fname))
         if not txt: continue
 
-        ans = extract_global_answers(txt)
+        # ans = extract_global_answers(txt)
+        ans = ""
         chunks = get_chunks(txt, CHUNK_SIZE, OVERLAP)
         stats['total_chunks'] += len(chunks)
 
