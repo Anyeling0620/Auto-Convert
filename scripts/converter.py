@@ -359,7 +359,7 @@ def process_chunk(args):
             # 【核心修改】退避策略：失败后睡 3 秒，不再疯狗式重试
             time.sleep(RETRY_DELAY)
 
-    return [], f"Chunk {idx + 1} 彻底失败 (API: {last_err})"
+    return [], f"Chunk {idx + 1} 彻底失败 (API: {last_err})", ""
 
 
 def main():
