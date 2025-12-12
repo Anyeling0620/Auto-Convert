@@ -22,12 +22,15 @@ jobs:
           # 【核心】直接把整个密钥池传进去
           ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
         run: python3.9 -u scripts/converter.py
 
       - name: 2. Validate Answers (Validator)
         env:
           ZHIPU_KEY_POOL: ${{ secrets.ZHIPU_KEY_POOL }}
-        run: python scripts/validator.py
+        run: python3.9 -u scripts/validator.py
 
       - name: Commit Result
         run: |
