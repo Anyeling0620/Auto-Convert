@@ -1,17 +1,17 @@
 import json
 import os
 import uuid
-import hashlib
 import time
 import requests
 import random
 import re
+import datetime
 from docx import Document
 from zhipuai import ZhipuAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ================= 🛡️ 智能配置加载模块 =================
+# ================= 🛡️ 配置加载 =================
 CONFIG_FILE = "config.json"
 
 
@@ -28,89 +28,82 @@ def load_config():
 APP_CONFIG = load_config()
 SUBJECT = APP_CONFIG.get("subject_name", "通用学科")
 DESC = APP_CONFIG.get("description", "")
-KEY_INDEX = APP_CONFIG.get("key_index", 0)  # 【核心】获取索引，默认用第一个
-
+KEY_INDEX = APP_CONFIG.get("key_index", 0)
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
 MAX_WORKERS = APP_CONFIG.get("max_workers", 16)
 
-# ================= 🔑 密钥池解析逻辑 =================
-# 读取环境变量里的整个字符串
+# ================= 🔑 环境与密钥 =================
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "local-dev")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "Local/Repo")
 KEY_POOL_STR = os.getenv("ZHIPU_KEY_POOL", "")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 
 
 def get_api_key():
-    """根据 Config 里的 index 从环境变量池中提取 Key"""
-    if not KEY_POOL_STR:
-        print("❌ 错误：环境变量 ZHIPU_KEY_POOL 未设置或为空！")
-        return None
-
-    # 按逗号切割
+    if not KEY_POOL_STR: return None
     keys = [k.strip() for k in KEY_POOL_STR.split(',') if k.strip()]
-
-    if not keys:
-        print("❌ 错误：密钥池中没有有效的 Key！")
-        return None
-
-    # 检查索引是否越界
-    if KEY_INDEX >= len(keys):
-        print(f"⚠️ 警告：config.json 请求第 {KEY_INDEX} 个 Key，但池子里只有 {len(keys)} 个。")
-        print(f"🔄 自动回滚使用第 1 个 Key。")
-        return keys[0]
-
-    print(f"🔑 已从池中选中第 {KEY_INDEX} 个 Key (Index {KEY_INDEX}) 进行工作。")
+    if not keys: return None
+    if KEY_INDEX >= len(keys): return keys[0]
     return keys[KEY_INDEX]
 
 
-# 获取最终的 Key
 ZHIPU_API_KEY = get_api_key()
-
 AI_MODEL_NAME = "glm-4-flash"
-CHUNK_SIZE = 2000
-OVERLAP = 200
-MAX_RETRIES = 5
+CHUNK_SIZE = 2000;
+OVERLAP = 200;
+MAX_RETRIES = 5;
 API_TIMEOUT = 120
-# =======================================================
 
 if not ZHIPU_API_KEY:
-    print("❌ 严重错误：无法获取有效的 ZHIPU_API_KEY，脚本终止。")
+    print("❌ 错误：无法获取 API Key")
     exit(1)
 
 client = ZhipuAI(api_key=ZHIPU_API_KEY)
 
-STANDARD_CATEGORIES = {
-    "A1型题", "A2型题", "B1型题", "X型题", "配伍题", "病例分析题",
-    "单选题", "多选题", "判断题", "填空题",
-    "名词解释题", "简答题", "论述题",
-    "计算题", "证明题", "编程题", "应用题", "综合题"
-}
 
-
-def get_next_output_filename():
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-    existing_files = [f for f in os.listdir(OUTPUT_DIR) if f.startswith("output") and f.endswith(".json")]
-    max_index = 0
-    for f in existing_files:
-        match = re.search(r'output(\d+)\.json', f)
-        if match:
-            idx = int(match.group(1))
-            if idx > max_index:
-                max_index = idx
-    return os.path.join(OUTPUT_DIR, f"output{max_index + 1}.json")
-
-
-def send_notification(title, content):
+# ================= 📧 报表推送模块 =================
+def send_report(data):
     if not PUSHPLUS_TOKEN: return
-    try:
-        requests.post("http://www.pushplus.plus/send", json={
-            "token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "html"
-        }, timeout=5)
-    except:
-        pass
+
+    is_success = data['failed_chunks'] == 0
+    color = "#28a745" if is_success else "#dc3545"
+    title = "✅ 题库生成成功" if is_success else "⚠️ 生成存在异常"
+
+    html = f"""
+    <div style="font-family:sans-serif; max-width:600px; padding:20px; border:1px solid #ddd; border-radius:8px;">
+        <div style="border-bottom:2px solid {color}; padding-bottom:10px; margin-bottom:20px;">
+            <h2 style="margin:0; color:#333;">{title}</h2>
+            <p style="color:#666; font-size:12px; margin:5px 0;">{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        </div>
+        <div style="background:#f8f9fa; padding:10px; border-radius:4px; margin-bottom:15px; font-size:14px;">
+            <p style="margin:4px 0;"><b>📚 学科:</b> {SUBJECT}</p>
+            <p style="margin:4px 0;"><b>🌿 分支:</b> {GITHUB_REF_NAME}</p>
+            <p style="margin:4px 0;"><b>🤖 模型:</b> {AI_MODEL_NAME}</p>
+        </div>
+        <ul style="padding-left:20px; margin-bottom:20px;">
+            <li>⏱️ 耗时: <b>{data['duration']:.1f}s</b></li>
+            <li>📄 文件: {data['file_count']} 个</li>
+            <li>📝 题目: <b style="color:#007bff; font-size:16px;">{data['total_questions']}</b> 道</li>
+            <li>🧩 切片: 成功 {data['success_chunks']} / 失败 <b style="color:red;">{data['failed_chunks']}</b></li>
+        </ul>
+    """
+
+    if data['errors']:
+        html += "<div style='background:#fff3cd; padding:10px; border-radius:4px; border:1px solid #ffeeba;'>"
+        html += "<h4 style='margin-top:0; color:#856404;'>⚠️ 异常详情</h4><ul style='padding-left:20px; color:#856404; font-size:13px;'>"
+        for err in data['errors']:
+            html += f"<li style='margin-bottom:4px;'>{err}</li>"
+        html += "</ul></div>"
+
+    html += "</div>"
+
+    requests.post("http://www.pushplus.plus/send", json={
+        "token": PUSHPLUS_TOKEN, "title": f"[{SUBJECT}] 生成报告", "content": html, "template": "html"
+    }, timeout=5)
 
 
+# ================= 🛠️ 核心逻辑 =================
 def read_docx(file_path):
     if not os.path.exists(file_path): return ""
     try:
@@ -120,213 +113,217 @@ def read_docx(file_path):
         return ""
 
 
-def get_chunks(text, chunk_size, overlap):
-    chunks = []
-    start = 0
-    total_len = len(text)
-    while start < total_len:
-        end = min(start + chunk_size, total_len)
+def get_chunks(text, size, overlap):
+    chunks = [];
+    start = 0;
+    total = len(text)
+    while start < total:
+        end = min(start + size, total)
         chunks.append(text[start:end])
-        if end == total_len: break
+        if end == total: break
         start = end - overlap
     return chunks
 
 
-def normalize_category(raw_cat):
-    if not raw_cat: return "综合题"
-    cat = raw_cat.strip()
-    # 医学
+def normalize_category(raw):
+    if not raw: return "综合题"
+    cat = raw.strip()
     if "A1" in cat: return "A1型题"
     if "A2" in cat: return "A2型题"
-    if "B1" in cat or "配伍" in cat: return "B1型题"
-    if "X型" in cat: return "X型题"
-    if "病例" in cat or "病案" in cat: return "病例分析题"
-    # 通用
-    if "多选" in cat or "不定项" in cat: return "多选题"
+    if "B1" in cat: return "B1型题"
+    if "X型" in cat or "多选" in cat: return "X型题"
     if "单选" in cat: return "单选题"
-    if "判断" in cat or "是非" in cat: return "判断题"
+    if "判断" in cat: return "判断题"
     if "填空" in cat: return "填空题"
-    if "名词" in cat: return "名词解释题"
-    if "简答" in cat or "问答" in cat: return "简答题"
-    if "论述" in cat: return "论述题"
-    # 理工
+    if "简答" in cat: return "简答题"
     if "计算" in cat: return "计算题"
-    if "证明" in cat: return "证明题"
-    if "编程" in cat or "代码" in cat: return "编程题"
-    if "应用" in cat or "设计" in cat: return "应用题"
-
-    if cat in STANDARD_CATEGORIES: return cat
-    if not cat.endswith("题"): return cat + "题"
-    return cat
+    if "编程" in cat: return "编程题"
+    if "病例" in cat: return "病例分析题"
+    return cat if cat.endswith("题") else cat + "题"
 
 
-def repair_json(json_str):
-    json_str = json_str.strip()
-    if "```json" in json_str:
-        json_str = json_str.split("```json")[1].split("```")[0]
-    elif "```" in json_str:
-        json_str = json_str.split("```")[1].split("```")[0]
-    json_str = json_str.strip()
-    if not json_str.endswith("]"):
-        last_brace = json_str.rfind("}")
-        if last_brace != -1:
-            json_str = json_str[:last_brace + 1] + "]"
+def repair_json(jstr):
+    jstr = jstr.strip()
+    if "```json" in jstr:
+        jstr = jstr.split("```json")[1].split("```")[0]
+    elif "```" in jstr:
+        jstr = jstr.split("```")[1].split("```")[0]
+    jstr = jstr.strip()
+    if not jstr.endswith("]"):
+        idx = jstr.rfind("}")
+        if idx != -1:
+            jstr = jstr[:idx + 1] + "]"
         else:
             return "[]"
-    return json_str
+    return jstr
 
 
-def extract_global_answers(full_text):
-    print("   🔍 [Step 1] 扫描文档参考答案...")
-    safe_text = full_text[:100000]
-    prompt = """
-    你是一个文档分析师。请提取文档中的“参考答案”。
-    要求：只提取答案文本（如 1.A 2.B），纯文本列表。如果不集中，返回“无”。
-    """
+def extract_global_answers(txt):
+    print("   🔍 扫描参考答案...")
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL_NAME,
-            messages=[{"role": "user", "content": prompt + "\n\n" + safe_text}],
-            temperature=0.1,
-            timeout=120
+        res = client.chat.completions.create(
+            model=AI_MODEL_NAME, messages=[{"role": "user", "content": "提取参考答案，纯文本列表。\n\n" + txt[:100000]}],
+            temperature=0.1, timeout=120
         )
-        return response.choices[0].message.content
+        return res.choices[0].message.content
     except:
         return ""
 
 
-def process_single_chunk(args):
-    chunk, index, total, answer_key = args
-
+def process_chunk(args):
+    chunk, idx, ans_key = args
     prompt = f"""
-    [系统角色]
-    你是一位**{SUBJECT}**领域的试题数据清洗专家。
-    背景：{DESC}
-    任务：将非结构化文本转换为符合 Schema 的 JSON 数组。
+        [系统角色设定]
+        你是由 Python 脚本调用的“全学科试题数据结构化引擎”。
+        **你不是聊天助手，严禁输出任何寒暄语、解释性文字或 Markdown 代码标记（如 ```json）。**
+        你的唯一任务是将输入的非结构化文本切片，精准解析为符合 Schema 定义的 JSON 数组。
 
-    [输入上下文：参考答案库]
-    {answer_key[:5000]}
+        [当前处理学科]
+        - 学科名称：**{SUBJECT}**
+        - 学科背景：{DESC}
+        （请利用学科背景知识来辅助判断题型，例如：医学常出现 A1/病例分析；计算机常出现编程/算法；数学常出现证明/计算）
 
-    [核心处理守则]
-    1. **边界丢弃**：切片首尾残缺句子直接丢弃。
-    2. **答案匹配**：
-       - 优先提取自带答案。
-       - 其次查参考答案库。
-       - 找不到留空 ""。严禁瞎猜。
-    3. **学科归类**：
-       - 医学：A1/A2/B1/病例分析。
-       - 理工：编程/计算/证明/应用。
-       - 通用：单选/多选/填空/判断。
+        [全局上下文：参考答案库]
+        ---------------------------------------------------------------------
+        {answer_key[:5000]} ... (若过长已自动截断，仅供查阅)
+        ---------------------------------------------------------------------
 
-    [JSON 输出结构]
-    Strict JSON Array.
-    [
-      {{
-        "category": "String (见映射表)",
-        "type": "Enum (SINGLE_CHOICE / MULTI_CHOICE / TRUE_FALSE / FILL_BLANK / ESSAY)",
-        "content": "String (题干)",
-        "options": [
-           {{"label": "A", "text": "..."}}
-        ],
-        "answer": "String",
-        "analysis": ""
-      }}
-    ]
+        [严格执行守则 (Chain of Constraints)]
 
-    [待处理文本]
-    {chunk}
-    """
+        1. **边界截断处理 (最高优先级)**：
+           - 输入文本是长文档的一个切片。
+           - **直接丢弃**切片开头处不完整的残缺段落（例如：只有选项没有题干）。
+           - **直接丢弃**切片末尾处不完整的残缺段落（例如：只有题干没有选项）。
+           - 只提取中间语义完整的题目。
 
-    for attempt in range(MAX_RETRIES):
+        2. **答案匹配逻辑 (三级瀑布流)**：
+           - **Level 1 (自带)**：优先提取题目文本内部自带的答案（例如：括号内的字母、题干末尾的答案、选项下方的“【答案】”）。
+           - **Level 2 (查表)**：提取题目中的【题号】（如 "53."），去上方的 [参考答案库] 中查找对应题号的答案。
+           - **Level 3 (留空)**：如果 Level 1 和 Level 2 都失败，`answer` 字段必须留空字符串 ""。**严禁根据题目内容自己做题！严禁随机生成！**
+
+        3. **文本清洗规则**：
+           - **Content 清洗**：移除题干开头的题号（例如："1. 下列哪项..." -> "下列哪项..."）。
+           - **Option 清洗**：移除选项开头的标签（例如："A. 阿司匹林" -> label:"A", text:"阿司匹林"）。
+           - **特殊符号**：保留代码块、数学公式（LaTeX）、化学式原本的格式，不要随意转义。
+
+        4. **题型归一化映射 (Category Mapping)**：
+           - **医学专用**：
+             * 5个选项(A-E)单选 -> "A1型题" 或 "A2型题"
+             * 共用题干/配伍 -> "B1型题"
+             * 多选题 -> "X型题"
+             * 病例描述/诊断 -> "病例分析题"
+           - **理工/计算机专用**：
+             * 代码补全/算法实现 -> "编程题"
+             * 数值计算/公式推导 -> "计算题"
+             * 逻辑证明 -> "证明题"
+             * 系统设计/应用场景 -> "应用题"
+           - **通用基础**：
+             * 4个选项单选 -> "单选题"
+             * 多个正确答案/不定项 -> "多选题"
+             * 对/错, T/F -> "判断题"
+             * 下划线/括号填空 -> "填空题"
+             * 无选项主观问答 -> "简答题"
+             * 名词解释 -> "名词解释题"
+
+        [输出格式规范 (JSON Schema)]
+        必须返回一个纯净的 JSON Array，包含以下字段：
+        [
+          {{
+            "category": "String (必须是上述映射表中的标准名称)",
+            "type": "Enum (SINGLE_CHOICE / MULTI_CHOICE / TRUE_FALSE / FILL_BLANK / ESSAY)",
+            "content": "String (清洗后的完整题干)",
+            "options": [
+               {{"label": "A", "text": "选项内容..."}},
+               {{"label": "B", "text": "选项内容..."}}
+            ],
+            "answer": "String (例如 'A', 'ABC', 'True', 'void main()...')",
+            "analysis": "String (如果文本中有解析则提取，否则留空)"
+          }}
+        ]
+
+        [待处理文本切片]
+        {chunk}
+        """
+
+    last_err = ""
+    for i in range(MAX_RETRIES):
         try:
-            temp = 0.0 if attempt < 2 else 0.1
-            response = client.chat.completions.create(
-                model=AI_MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temp,
-                top_p=0.7,
-                max_tokens=4000,
-                timeout=API_TIMEOUT
+            res = client.chat.completions.create(
+                model=AI_MODEL_NAME, messages=[{"role": "user", "content": prompt}],
+                temperature=0.1, top_p=0.7, max_tokens=4000, timeout=API_TIMEOUT
             )
-            content = response.choices[0].message.content
-            content = repair_json(content)
-
+            content = repair_json(res.choices[0].message.content)
             try:
-                res = json.loads(content)
-                if isinstance(res, list): return res
-                if isinstance(res, dict): return [res]
-                return []
-            except json.JSONDecodeError:
+                data = json.loads(content)
+                if isinstance(data, list): return data, None
+                if isinstance(data, dict): return [data], None
+                return [], f"Chunk {idx + 1}: JSON格式异常"
+            except:
                 continue
+        except Exception as e:
+            last_err = str(e)
+            time.sleep((2 ** i) + random.random())
 
-        except Exception:
-            wait_time = (2 ** attempt) + random.uniform(0, 1)
-            time.sleep(wait_time)
-
-    return []
+    return [], f"Chunk {idx + 1} 失败 (API: {last_err})"
 
 
 def main():
-    start_time = time.time()
+    st = time.time()
+    if not os.path.exists(INPUT_DIR): return
+    files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".docx")]
+    if not files: return
 
-    if not os.path.exists(INPUT_DIR): os.makedirs(INPUT_DIR)
-    docx_files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".docx")]
+    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+    exist_files = [f for f in os.listdir(OUTPUT_DIR) if f.startswith("output") and f.endswith(".json")]
+    next_idx = 1
+    for f in exist_files:
+        m = re.search(r'output(\d+)', f)
+        if m: next_idx = max(next_idx, int(m.group(1)) + 1)
+    target_file = os.path.join(OUTPUT_DIR, f"output{next_idx}.json")
 
-    if not docx_files:
-        print("❌ input 目录为空。")
-        return
+    print(f"🚀 [{SUBJECT}] 启动 | 分支: {GITHUB_REF_NAME}")
 
-    target_output_file = get_next_output_filename()
-    print(f"🚀 [{SUBJECT}] 全速工厂启动 | 目标: {target_output_file} | 线程: {MAX_WORKERS}")
+    all_qs = []
+    stats = {"file_count": len(files), "total_chunks": 0, "success_chunks": 0, "failed_chunks": 0, "errors": []}
 
-    all_questions = []
+    for fname in files:
+        print(f"\n📄 {fname}")
+        txt = read_docx(os.path.join(INPUT_DIR, fname))
+        if not txt: continue
 
-    for filename in docx_files:
-        print(f"\n📄 处理文件: {filename}")
-        raw_text = read_docx(os.path.join(INPUT_DIR, filename))
-        if not raw_text: continue
+        ans = extract_global_answers(txt)
+        chunks = get_chunks(txt, CHUNK_SIZE, OVERLAP)
+        stats['total_chunks'] += len(chunks)
 
-        global_answers = extract_global_answers(raw_text)
-        chunks = get_chunks(raw_text, CHUNK_SIZE, OVERLAP)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exc:
+            futures = [exc.submit(process_chunk, (c, i, ans)) for i, c in enumerate(chunks)]
+            for fut in tqdm(as_completed(futures), total=len(chunks)):
+                qs, err = fut.result()
+                if err:
+                    stats['failed_chunks'] += 1
+                    stats['errors'].append(err)
+                    print(f"   ❌ {err}")
+                else:
+                    stats['success_chunks'] += 1
+                    if qs:
+                        for q in qs:
+                            q['id'] = str(uuid.uuid4())
+                            q['number'] = len(all_qs) + 1
+                            q['chapter'] = fname.replace(".docx", "")
+                            q['category'] = normalize_category(q.get('category', '综合题'))
+                            if 'analysis' not in q: q['analysis'] = ""
+                            all_qs.append(q)
 
-        tasks_args = [(chunk, i, len(chunks), global_answers) for i, chunk in enumerate(chunks)]
-        chunk_added = 0
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 全速模式：不加 sleep 延迟
-            results = list(tqdm(executor.map(process_single_chunk, tasks_args), total=len(chunks), unit="切片"))
-
-            for items in results:
-                if items:
-                    for item in items:
-                        item['id'] = str(uuid.uuid4())
-                        item['number'] = len(all_questions) + 1
-                        item['chapter'] = filename.replace(".docx", "")
-                        item['category'] = normalize_category(item.get('category', '综合题'))
-                        if 'analysis' not in item: item['analysis'] = ""
-                        all_questions.append(item)
-                        chunk_added += 1
-
-        print(f"   ✅ 本文件提取: {chunk_added} 道")
-
-    final_json = {
-        "version": "FullSpeed-V5",
-        "subject": SUBJECT,
-        "source": "GLM-4-Flash",
-        "total_count": len(all_questions),
-        "data": all_questions
-    }
-
-    with open(target_output_file, 'w', encoding='utf-8') as f:
-        json.dump(final_json, f, ensure_ascii=False, indent=2)
-
-    duration = time.time() - start_time
-    msg = f"[{SUBJECT}] 转换完成！\n耗时: {duration:.1f}s\n文件: {target_output_file}\n题数: {len(all_questions)}"
-    print(f"\n✨ {msg}")
-
+    final = {"version": "V7-Report", "subject": SUBJECT, "data": all_qs}
+    with open(target_file, 'w', encoding='utf-8') as f:
+        json.dump(final, f, ensure_ascii=False, indent=2)
     with open("last_generated_file.txt", "w") as f:
-        f.write(target_output_file)
+        f.write(target_file)
+
+    stats['duration'] = time.time() - st
+    stats['total_questions'] = len(all_qs)
+    print(f"\n✨ 完成！提取 {len(all_qs)} 题")
+    send_report(stats)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

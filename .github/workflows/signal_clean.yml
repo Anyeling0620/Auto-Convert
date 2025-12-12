@@ -1,0 +1,54 @@
+name: Signal Clean Input
+
+# 监听规则：只有当 empty 文件夹内的文件发生变化时触发
+on:
+  push:
+    paths:
+      - 'empty/**'
+
+jobs:
+  clean-input:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写权限来提交删除操作
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name "Cleaner-Bot"
+          git config --global user.email "bot@cleaner.com"
+
+      - name: Execute Cleaning
+        run: |
+          echo "🚨 检测到 'empty' 文件夹变动，启动清理程序..."
+          
+          # 1. 确保 input 文件夹存在 (防止意外报错)
+          mkdir -p input
+          
+          # 2. 暴力清空 input 下的所有文件 (Git 层面删除)
+          # --ignore-unmatch 防止文件夹本来就是空的导致报错
+          git rm -rf input/* --ignore-unmatch
+          
+          # 3. 重新创建 .gitkeep 占位符 (复活)
+          touch input/.gitkeep
+          
+          # 4. 将 .gitkeep 加入暂存区
+          git add input/.gitkeep
+          
+          echo "✅ input 目录已重置，仅保留 .gitkeep"
+
+      - name: Commit and Push
+        run: |
+          # 检查是否有东西需要提交 (避免空提交报错)
+          if git diff --cached --quiet; then
+            echo "无需变更 (input本来就是空的)"
+          else
+            git commit -m "Auto-Clean: Reset input directory by signal"
+            
+            # 推送到触发该 Action 的分支 (无论是 main 还是 med/cs)
+            git push origin ${{ github.ref_name }}
+            echo "🚀 清理结果已推送至 ${{ github.ref_name }} 分支"
+          fi
