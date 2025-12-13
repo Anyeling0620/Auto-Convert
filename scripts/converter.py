@@ -58,7 +58,7 @@ if not API_KEYS:
 # ================= ⚙️ 性能策略 (稳健版) =================
 MAX_WORKERS = 8  # 并发数
 AI_MODEL_NAME = "glm-4-flash"
-CHUNK_SIZE = 1500  # 切片大小
+CHUNK_SIZE = 800  # 切片大小
 OVERLAP = 100
 MAX_RETRIES = 5  # 重试次数
 API_TIMEOUT = 80  # 超时时间
